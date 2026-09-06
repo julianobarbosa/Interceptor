@@ -5,3 +5,10 @@
 #
 # [agents.bmad-agent-pm]
 # description = "Prefers short, bulleted PRDs over narrative drafts."
+
+# Pin the output folder to the repo root. The installer writes a bare relative
+# "_bmad-output" into _bmad/config.toml, which resolves against the current
+# working directory rather than the project; {project-root} anchors it so the
+# path is the same no matter where a command is run from.
+[core]
+output_folder = "{project-root}/_bmad-output"
