@@ -85,3 +85,26 @@ use-cases/deep-research-demo/
 
 # graphify knowledge-graph output (local analysis artifacts, never shipped)
 **/graphify-out/
+
+# ── BMAD Method ──────────────────────────────────────────────────────────
+# The vendored framework and its regenerated per-IDE skill trees (~5500 files)
+# are reinstalled by `bunx bmad-method install`, so only the intent an install
+# replays stays tracked: recorded answers, custom modules, agent memory.
+.agent/
+.agents/
+.opencode/
+.gemini/
+.pi/
+.claude/skills/bmad-*/
+.claude/skills/wds-*/
+.github/agents/bmad-*.agent.md
+_bmad/*
+!_bmad/config.toml
+!_bmad/custom/
+!_bmad/_memory/
+_bmad/**/config.user.toml
+_bmad/config.toml.bak
+_bmad/render/
+.bmad-loop/runs/
+.bmad-loop/cache/
+.bmad-loop/policy.toml
