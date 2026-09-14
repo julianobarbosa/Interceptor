@@ -6,13 +6,20 @@
  * combines the results into a single output.
  */
 
-import { sendCommand, sendCommandWs, type DaemonResponse } from "../transport"
+import { ActionValidationError, sendCommand, sendCommandWs, type DaemonResponse } from "../transport"
+import { humanizeError, isChromeMessagingError } from "../format"
 import { parseElementTarget } from "../parse"
 import { hasTrustedFlag } from "./flags"
+import { normalizeArgsSplit } from "../normalize"
 import { maybeEmitResearchHint } from "./research"
 
 type Action = { type: string; [key: string]: unknown }
-type Result = { success: boolean; error?: string; data?: unknown; tabId?: number }
+// `delivered: false` rides back from the content script when it refused before
+// touching the page (stale element); `deliveryAttempted: false` is the CLI-side
+// equivalent for validation failures. Neither gets the "delivery is unverified"
+// caveat: nothing happened, and saying otherwise sent agents re-reading a page
+// that never changed.
+type Result = { success: boolean; error?: string; data?: unknown; tabId?: number; deliveryAttempted?: boolean; delivered?: boolean }
 type ReadAggregate = {
   success: boolean
   tree?: string
@@ -32,12 +39,24 @@ function textData(result: Result): string {
   return JSON.stringify(result.data, null, 2)
 }
 
+// Output budget. Agent harnesses truncate large tool results themselves
+// (1,282 Codex results at a median of 12.6k tokens in the 2026-09-10 review,
+// most of them bare `open`), and a truncated result hides the marker that
+// says how to scope. Two knobs, set once per lane; defaults unchanged.
+function envInt(name: string, fallback: number): number {
+  const raw = process.env[name]
+  const n = raw ? parseInt(raw, 10) : NaN
+  return Number.isFinite(n) && n > 0 ? n : fallback
+}
+export const TREE_MAX_CHARS = envInt("INTERCEPTOR_TREE_MAX_CHARS", 50_000)
+export const TEXT_MAX_CHARS = envInt("INTERCEPTOR_TEXT_MAX_CHARS", 8_000)
+
 function truncateText(text: string, maxChars: number): string {
   if (text.length <= maxChars) return text
   // Explicit truncation marker so agents know to scope or widen instead of
   // escaping to ?action=raw / view-source when rendered text appears missing.
   return text.slice(0, maxChars) +
-    `\n... (truncated: showed ${maxChars} of ${text.length} chars. Pass --full to see all, or 'read e<ref> --text-only' to scope, or 'find "<term>"' to jump.)`
+    `\n... (truncated: showed ${maxChars} of ${text.length} chars. Pass --full to see all, or 'read e<ref> --text-only' to scope, or 'find "<term>"' to jump; INTERCEPTOR_TEXT_MAX_CHARS raises the cap.)`
 }
 
 async function send(action: Action, tabId?: number, useWs = false, contextId?: string): Promise<Result> {
@@ -47,7 +66,7 @@ async function send(action: Action, tabId?: number, useWs = false, contextId?: s
       : await sendCommand(action, tabId, contextId)
     return unwrap(resp)
   } catch (err) {
-    return { success: false, error: (err as Error).message }
+    return { success: false, error: (err as Error).message, deliveryAttempted: !(err instanceof ActionValidationError) }
   }
 }
 
@@ -73,7 +92,7 @@ export function aggregateReadResults(opts: {
       // Default text cap is 8,000 chars — large enough to fit a mid-sized
       // page intro without forcing --full. --full unlocks the full 200K
       // cap from the extension side.
-      if (!opts.full) text = truncateText(text, 8000)
+      if (!opts.full) text = truncateText(text, TEXT_MAX_CHARS)
     } else if (opts.textResult?.error) {
       warnings.push(`text: ${opts.textResult.error}`)
     }
@@ -101,7 +120,7 @@ export function buildReadTreeAction(opts: {
   const base: Omit<Action, "type"> = {
     depth: 15,
     filter: opts.filterMode,
-    maxChars: 50000,
+    maxChars: TREE_MAX_CHARS,
     includeStyle: opts.includeStyle,
     ...(opts.treeFormat === "compact" ? { treeFormat: "compact" } : {})
   }
@@ -178,6 +197,11 @@ export async function runOpen(
   const noWait = filtered.includes("--no-wait")
   const timeoutIdx = filtered.indexOf("--timeout")
   const timeout = timeoutIdx !== -1 ? parseInt(filtered[timeoutIdx + 1]) : 5000
+  // `read` honored --tree-format; `open` (the skill's fast path) silently
+  // ignored it, so the compact tree was never available where it mattered most.
+  const openTreeFormatIdx = filtered.indexOf("--tree-format")
+  const openTreeFormat: "verbose" | "compact" =
+    openTreeFormatIdx !== -1 && filtered[openTreeFormatIdx + 1] === "compact" ? "compact" : "verbose"
 
   // Step 1: Create tab (or reuse an existing managed one when --reuse is set,
   // or by policy default for named-group calls)
@@ -219,7 +243,7 @@ export async function runOpen(
 
   if (!textOnly) {
     treeResult = await send(
-      { type: "get_a11y_tree", depth: 15, filter: "interactive", maxChars: 50000 },
+      { type: "get_a11y_tree", depth: 15, filter: "interactive", maxChars: TREE_MAX_CHARS, ...(openTreeFormat === "compact" ? { treeFormat: "compact" } : {}) },
       tabId, useWs, contextId
     )
   }
@@ -432,7 +456,7 @@ export async function runWebsearch(
   let treeResult: Result | undefined
   let textResult: Result | undefined
   if (!textOnly) {
-    treeResult = await send({ type: "get_a11y_tree", depth: 15, filter: "interactive", maxChars: 50000 }, tabId, useWs, contextId)
+    treeResult = await send({ type: "get_a11y_tree", depth: 15, filter: "interactive", maxChars: TREE_MAX_CHARS }, tabId, useWs, contextId)
   }
   if (!treeOnly) {
     textResult = await send({ type: markdown ? "extract_markdown" : "extract_text" }, tabId, useWs, contextId)
@@ -595,42 +619,44 @@ export async function runAct(
   globalTabId?: number,
   jsonMode = false,
   useWs = false,
-  contextId?: string
+  contextId?: string,
+  positionalCount?: number
 ): Promise<void> {
+  const normalized = positionalCount === undefined ? normalizeArgsSplit(filtered) : { argv: filtered, positionalCount }
+  filtered = normalized.argv
+  const positionalEnd = normalized.positionalCount + 1
+  const flags = filtered.slice(positionalEnd)
   const ref = filtered[1]
   if (!ref) {
     console.error("error: interceptor act requires a ref. Usage: interceptor act <ref> [value]")
     process.exit(1)
   }
 
-  const useOs = hasTrustedFlag(filtered)
-  const append = filtered.includes("--append")
-  const noRead = filtered.includes("--no-read")
-  const keysIdx = filtered.indexOf("--keys")
-  const timeoutIdx = filtered.indexOf("--timeout")
-  const timeout = timeoutIdx !== -1 ? parseInt(filtered[timeoutIdx + 1]) : 2000
-
-  // Find value: everything after ref that isn't a flag
-  const flagSet = new Set(["--trusted", "--os", "--append", "--no-read", "--keys", "--timeout"])
-  const valueArgs: string[] = []
-  let skip = false
-  for (let i = 2; i < filtered.length; i++) {
-    if (skip) { skip = false; continue }
-    if (filtered[i] === "--timeout" || filtered[i] === "--keys") { skip = true; continue }
-    if (flagSet.has(filtered[i])) continue
-    valueArgs.push(filtered[i])
+  if (["click", "type", "keys"].includes(ref) && /^e\d+(?:_\d+)?$/.test(filtered[2] ?? "")) {
+    output(jsonMode, { success: false, error: `act takes the ref directly. Use interceptor act ${filtered[2]} [value]` })
+    return
   }
+  const useOs = hasTrustedFlag(flags)
+  const append = flags.includes("--append")
+  const noRead = flags.includes("--no-read")
+  const keysIdx = flags.indexOf("--keys")
+  if (keysIdx !== -1 && (flags[keysIdx + 1] === undefined || flags[keysIdx + 1].startsWith("--"))) {
+    output(jsonMode, { success: false, error: "act --keys requires a key chord, e.g. interceptor act e5 --keys Enter" })
+    return
+  }
+  const timeoutIdx = flags.indexOf("--timeout")
+  const timeout = timeoutIdx !== -1 ? parseInt(flags[timeoutIdx + 1]) : 2000
+  const valueArgs = filtered.slice(2, positionalEnd)
   const value = valueArgs.length > 0 ? valueArgs.join(" ") : undefined
 
   const target = parseElementTarget(ref)
 
   // Step 1: Perform the action (may throw if click navigates the page)
   let actionResult: Result
-  let actionNavigated = false
 
   try {
   if (keysIdx !== -1) {
-    const keys = filtered[keysIdx + 1]
+    const keys = flags[keysIdx + 1]
     if (useOs) {
       const keyParts = keys.split("+")
       const key = keyParts[keyParts.length - 1]
@@ -669,33 +695,21 @@ export async function runAct(
   }
 
   } catch (err) {
-    // Click succeeded but page navigated, breaking the response port
-    const msg = (err as Error).message || ""
-    if (msg.includes("back/forward cache") || msg.includes("message channel is closed") || msg.includes("timeout")) {
-      actionNavigated = true
-      actionResult = { success: true }
-    } else {
-      output(jsonMode, { success: false, error: msg })
+    if (err instanceof ActionValidationError) {
+      output(jsonMode, { success: false, error: err.message })
       return
     }
+    actionResult = { success: false, error: (err as Error).message }
   }
 
   if (!actionResult!.success) {
-    const errMsg = actionResult!.error || "action failed"
-    if (errMsg.includes("back/forward cache") || errMsg.includes("message channel is closed")) {
-      actionNavigated = true
-    } else {
-      output(jsonMode, { success: false, error: errMsg })
-      return
-    }
-  }
-
-  if (actionNavigated) {
-    if (jsonMode) {
-      output(jsonMode, { success: true, data: { action: "ok", note: "page navigated — use interceptor read to see the new page" } })
-    } else {
-      console.log("ok (page navigated — use interceptor read to see the new page)")
-    }
+    const errMsg = humanizeError(actionResult!.error) || "action failed"
+    const nothingHappened = actionResult!.deliveryAttempted === false || actionResult!.delivered === false
+    output(jsonMode, {
+      success: false,
+      error: nothingHappened ? errMsg : `${errMsg.replace(/[.\s]+$/, "")}. Delivery is unverified; read the target before retrying.`,
+      ...(actionResult!.delivered === false ? { delivered: false } : {}),
+    })
     return
   }
 
@@ -711,18 +725,26 @@ export async function runAct(
     await send({ type: "wait_stable", ms: 200, timeout }, globalTabId, useWs, contextId)
 
     // Step 3: Get updated tree + diff
-    treeResult = await send(
-      { type: "get_a11y_tree", depth: 15, filter: "interactive", maxChars: 50000 },
+    const readTree = () => send(
+      { type: "get_a11y_tree", depth: 15, filter: "interactive", maxChars: TREE_MAX_CHARS },
       globalTabId, useWs, contextId
     )
-    diffResult = await send({ type: "diff" }, globalTabId, useWs, contextId)
-  } catch {
-    // Page likely navigated — action succeeded but post-read failed
-    if (jsonMode) {
-      output(jsonMode, { success: true, data: { action: "ok", note: "page navigated, post-action read unavailable" } })
-    } else {
-      console.log("ok (page navigated — use interceptor read to see the new page)")
+    treeResult = await readTree()
+    if (!treeResult.success && isChromeMessagingError(treeResult.error)) {
+      // The action started a navigation: the old document's content script
+      // answered for the last time and Chrome closed the channel. Wait for
+      // the new document to settle and read it once more instead of handing
+      // the agent Chrome's "message port closed" text (276 results, 2026-09-10).
+      await send({ type: "wait_stable", ms: 200, timeout }, globalTabId, useWs, contextId)
+      treeResult = await readTree()
     }
+    diffResult = await send({ type: "diff" }, globalTabId, useWs, contextId)
+  } catch (err) {
+    treeResult = { success: false, error: (err as Error).message }
+  }
+  if (!treeResult.success) {
+    const reason = (humanizeError(treeResult.error) ?? "unknown error").replace(/[.\s]+$/, "")
+    output(jsonMode, { success: true, data: { action: "delivered", verified: false, note: `Post-action read unavailable: ${reason}. Read the target to verify its state.` } })
     return
   }
 
@@ -768,7 +790,7 @@ export async function runInspect(
 
   if (!netOnly) {
     const treeResult = await send(
-      { type: "get_a11y_tree", depth: 15, filter: "interactive", maxChars: 50000 },
+      { type: "get_a11y_tree", depth: 15, filter: "interactive", maxChars: TREE_MAX_CHARS },
       globalTabId, useWs, contextId
     )
     treeData = textData(treeResult)
@@ -846,14 +868,14 @@ function output(jsonMode: boolean, result: { success: boolean; error?: string; d
 export async function runCompoundCommand(
   cmd: string,
   filtered: string[],
-  opts: { jsonMode?: boolean; useWs?: boolean; globalTabId?: number; anyTab?: boolean; contextId?: string }
+  opts: { jsonMode?: boolean; useWs?: boolean; globalTabId?: number; anyTab?: boolean; contextId?: string; positionalCount?: number }
 ): Promise<void> {
   switch (cmd) {
     case "open":    return runOpen(filtered, opts.globalTabId, opts.jsonMode, opts.useWs, opts.contextId)
     case "websearch":
     case "search":  return runWebsearch(filtered, opts.globalTabId, opts.jsonMode, opts.useWs, opts.contextId)
     case "read":    return runRead(filtered, opts.globalTabId, opts.jsonMode, opts.useWs, opts.contextId)
-    case "act":     return runAct(filtered, opts.globalTabId, opts.jsonMode, opts.useWs, opts.contextId)
+    case "act":     return runAct(filtered, opts.globalTabId, opts.jsonMode, opts.useWs, opts.contextId, opts.positionalCount)
     case "inspect":  return runInspect(filtered, opts.globalTabId, opts.jsonMode, opts.useWs, opts.contextId)
     default:
       console.error(`error: unknown compound command '${cmd}'`)

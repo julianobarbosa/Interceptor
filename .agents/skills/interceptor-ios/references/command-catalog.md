@@ -9,13 +9,13 @@ phone is set up. Phones auto-connect on the first drive verb.
 | Command | What it does |
 |---|---|
 | `interceptor ios setup [<device>] [--team <id>]` | Xcode self-service: build + sign + install + launch the runner using the Apple ID signed into Xcode. |
-| `interceptor ios login --apple-id <id> --password <pw> [--code <2fa>]` | No-Xcode path: sign in with the user's own Apple ID (token stored in the Keychain, never the password). One time. |
-| `interceptor ios logout` | Drop the stored Apple-ID token. |
+| `interceptor ios login` | Unsupported compatibility command. Fails before password input and points to `ios setup`. |
+| `interceptor ios logout` | Remove legacy stored Apple-ID data. |
 | `interceptor ios refresh [<device>]` | Re-sign the installed runner now (also automatic before certificate expiry). |
-| `interceptor ios install [<device>]` | Push / refresh the prebuilt agent (operator path). |
+| `interceptor ios install [<device>]` | Reinstall a runner already signed by `ios setup`. Refuses the unsigned release input. |
 | `interceptor ios devices` | Phones with the agent installed, plus aliases, transport (USB/network), and iOS version. |
 | `interceptor ios discover` | Full device discovery with toolchain + readiness notes. |
-| `interceptor ios status` | Per-phone connection state: `connected` while driving, `disconnected` when installed but idle. |
+| `interceptor ios status` | Per-phone connection state: `connected` while the resident runner is dialed in, with its registration time; `disconnected` when it is not (the next drive verb auto-connects). |
 | `interceptor ios name <device> <alias>` | Alias a phone so you can use `--on <alias>` (e.g. `--on phone`). |
 
 ## Drive verbs
@@ -78,11 +78,17 @@ they work even when the runner is idle or asleep. Routed before the runner fallb
   they never go stale the way server-side element ids do — but they only reflect the
   screen at read time. Re-read after any navigation.
 - **Unlocked + foreground.** A locked phone refuses app launches. Keep Auto-Lock off so
-  the runner stays resident; while it is resident, `ios unlock --secret <name>` clears the
-  lock screen. After a reboot the runner cannot start on a locked phone, so unlock once by hand.
+  the runner stays resident; while connected, `ios unlock --secret <name>` attempts
+  passcode entry and requires an observed unlocked state for success. Disconnected unlock
+  and `--probe` fail immediately. Unlock once and run `ios tree` to connect first.
 - **Passcodes come from the vault.** Nothing can fake Face ID or Apple Pay. A passcode sheet
   is typed with `ios type <ref> --secret <name>` / `ios keys --secret <name>`; never put a
   passcode in a literal `type` call. Register it once with
   `interceptor macos secret register <name> --target ios`.
-- **After a device reboot.** The phone drops off usbmux (its Wi‑Fi route is cleared even though `xcrun devicectl list devices` still lists it) → a brief USB cable touch reseeds it. The first runner launch also pops an on-device *"Enter iPhone Passcode for XCTest — Enable UI Automation"* dialog; approve it, then a daemon restart clears the stale testmanagerd session. Runner-free lanes (`proc`/`shot`) keep working through all of this.
+- **After a device reboot.** The phone drops off usbmux (its Wi‑Fi route is cleared even though `xcrun devicectl list devices` still lists it) → a brief USB cable touch reseeds it. The first runner launch also pops an on-device *"Enter iPhone Passcode for XCTest — Enable UI Automation"* dialog. Runner-free lanes (`proc`/`shot`) keep working through all of this.
+- **The XCTest authorization sheet cannot be entered from the Mac. Stop and ask.** It blocks the runner itself, so `ios unlock` / `keys --secret` cannot reach it; AccessibilityAudit and Accessibility Inspector read it but every action on it reports unsupported (field stays `0 of 6`); Switch Control cannot target a digit; iPhone Mirroring does not forward keystrokes to it; re-signed copies of Apple's tools lose the private entitlements. Report the sheet and ask for a tap on the phone (or a paired hardware keyboard), then restart the daemon (drops the stale testmanagerd session) and retry.
+- **Unsigned or stale staged runner.** A drive verb now fails in under a second with the signing reason and `run: interceptor ios setup <udid>` instead of a two-minute "did not register" timeout; an early `xcodebuild` exit is reported with its exit code and stderr tail. Run `interceptor ios setup` when you see either. A runner that `ios setup` built is kept across package upgrades (the bundled unsigned build no longer replaces it); run `interceptor ios refresh` to rebuild on a newer bundled runner.
+- **Runner socket dropped.** The daemon holds the session for 10 s (`ios status` shows `connecting`) while the runner re-dials; only a lapsed window or a dead launch process tears it down.
+- **Runner never registers (`did not register within 120s`).** The error names the address the runner was handed and the rung that chose it (`ios status` → `dialBack` / `dialBackVia`). A local-network address (rungs `interface`, `subnet`, `default-route`, `first`) is silently denied while the runner's Local Network privilege is still undetermined: XCTest backgrounds the runner before it dials, and iOS denies a backgrounded app's local-network connection without showing the alert (TN3179). Once Settings › Privacy & Security › Local Network shows InterceptorRunner-Runner switched on, LAN dial-back registers in about 10 s. Fixes: grant that switch, or put the phone and Mac on the same VPN (Tailscale), which the daemon prefers automatically (`dialBackVia: vpn`). `INTERCEPTOR_WS_URL` overrides the ladder.
+- **Away from home (phone on cellular + VPN only).** Not driveable: iOS does not expose lockdown (62078) or RemotePairing (49152) on the VPN interface (`Connection refused`), so usbmuxd cannot see the phone and no runner can be launched. A computer next to the phone (USB or its Wi-Fi) must run the daemon. Runner-free lanes are equally blocked.
 - Add `--json` to any command for machine-readable output.

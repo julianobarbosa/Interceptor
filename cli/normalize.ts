@@ -64,7 +64,14 @@ const STATE = ["--depth", "--filter", "--limit", "--max-chars", "--role"]
 // treats them as booleans and strips their operands, so
 // `click --selector button --nth 4` arrives with selector === "--nth".
 // --secret names a vault entry for `type` (issue #244); the value never rides argv.
-const ACTIONS = ["--at", "--duration", "--from", "--nth", "--secret", "--selector", "--steps", "--to"]
+// --browser-login names the host whose saved login to fill; --browser picks one
+// Chromium browser to read (issue #248).
+const ACTIONS = ["--at", "--browser", "--browser-login", "--duration", "--from", "--secret", "--steps", "--to"]
+// CSS targeting is implemented by `click` alone (cli/commands/actions.ts). When
+// every action verb accepted --selector here, `dblclick --selector x` parsed
+// `--selector` as the element target and failed as "stale element" (agent
+// session log, 2026-09-09). Other verbs reject it with a hint instead.
+const CLICK = [...ACTIONS, "--nth", "--selector"]
 const NAV = ["--amount", "--ms", "--timeout"]
 const NET = ["--filter", "--format", "--limit", "--out", "--since", "--pattern", "--patterns", "--type"]
 const SCREENSHOT = ["--clip", "--element", "--filter", "--format", "--kind", "--limit", "--quality", "--ref", "--region", "--scale", "--selector", "--target-max-long-edge", "--threshold"]
@@ -72,7 +79,7 @@ const DATA = ["--since"]
 const META = ["--css", "--frame-ids", "--since"]
 const SAVE = ["--out", "--chunk-size"]
 const BATCH = ["--timeout"]
-const MONITOR = ["--capture", "--format", "--guard-policy", "--instruction", "--mode", "--out", "--retention-policy", "--session", "--task", "--verifier-policy", "--persist-bodies"]
+const MONITOR = ["--capture", "--file", "--format", "--guard-policy", "--instruction", "--mode", "--out", "--retention-policy", "--session", "--task", "--verifier-policy", "--persist-bodies"]
 const SCENE = ["--profile", "--slide", "--type"]
 const SSE = ["--filter", "--limit", "--timeout"]
 const RESEARCH = ["--dir", "--effort", "--note", "--slug", "--status"]
@@ -96,7 +103,7 @@ const VALUE_FLAGS_BY_CMD: Record<string, string[]> = {
   // state
   state: STATE, tree: STATE, diff: STATE, find: STATE, text: STATE, html: STATE,
   // actions
-  click: ACTIONS, type: ACTIONS, select: ACTIONS, focus: ACTIONS, blur: ACTIONS,
+  click: CLICK, type: ACTIONS, select: ACTIONS, focus: ACTIONS, blur: ACTIONS,
   hover: ACTIONS, drag: ACTIONS, dblclick: ACTIONS, rightclick: ACTIONS,
   check: ACTIONS, keys: ACTIONS, "click-at": ACTIONS, "what-at": ACTIONS, regions: ACTIONS,
   // navigation
@@ -132,7 +139,7 @@ const VALUE_FLAGS_BY_CMD: Record<string, string[]> = {
 // consumption pattern, so keep it in sync when adding a family here.
 const COMPOUND_BOOL = ["--activate", "--append", "--full", "--include-frames", "--include-style", "--markdown", "--net-only", "--no-read", "--no-reuse", "--no-wait", "--os", "--reuse", "--text-only", "--tree-only", "--trusted"]
 const STATE_BOOL = ["--elements-only", "--full", "--include-frames", "--markdown", "--native", "--text-only"]
-const ACTIONS_BOOL = ["--append", "--dropzone", "--picker", "--trusted", "--os"]
+const ACTIONS_BOOL = ["--append", "--dropzone", "--picker", "--trusted", "--os", "--user"]
 const TABS_BOOL = ["--incognito"]
 const TAB_BOOL = ["--activate", "--no-reuse", "--reuse"]
 const NET_BOOL = ["--from-start", "--persist", "--reload", "--redact-auth"]
@@ -166,7 +173,7 @@ const BOOLEAN_FLAGS_BY_CMD: Record<string, string[]> = {
   capabilities: META_BOOL, modals: META_BOOL, panels: META_BOOL,
   eval: EVAL_BOOL, save: SAVE_BOOL, brand: [], group: [], batch: BATCH_BOOL, raw: BATCH_BOOL,
   monitor: MONITOR_BOOL, scene: SCENE_BOOL, sse: [], override: [],
-  upgrade: ["--full"], init: ["--explain", "--verbose"], research: RESEARCH_BOOL, extensions: ["--remove"], contexts: [],
+  upgrade: ["--full"], init: ["--explain", "--verbose"], research: RESEARCH_BOOL, extensions: ["--remove"], contexts: ["--verbose"],
   skills: SKILLS_BOOL, daemon: [], manifest: [],
   keepawake: POWER_BOOL, idle: POWER_BOOL,
 }
@@ -192,6 +199,9 @@ function rejectUnknownFlag(cmd: string, tok: string): void {
   if (name === "--out" && (cmd === "screenshot" || cmd === "canvas" || cmd === "capture" || cmd === "ocr")) {
     extra = " (--out belongs to 'save' and 'net'; 'screenshot --save' writes the image to disk)"
   }
+  if ((name === "--selector" || name === "--nth") && cmd !== "click") {
+    extra = ` (CSS targeting is a 'click' flag; for '${cmd}' run 'interceptor query "<css>"' to get an e<ref>, then 'interceptor ${cmd} e<ref>')`
+  }
   const msg = `unknown flag '${tok}' for '${cmd}'${extra}. Run 'interceptor help ${cmd}' for its flags; use '--' before positional values that begin with --.`
   if (lax) {
     if (!warnedLaxFlags) {
@@ -200,8 +210,7 @@ function rejectUnknownFlag(cmd: string, tok: string): void {
     }
     return
   }
-  console.error(`error: ${msg}`)
-  process.exit(1)
+  throw new Error(msg)
 }
 
 export type NormalizedArgs = { argv: string[]; positionalCount: number }
@@ -240,8 +249,7 @@ export function normalizeArgsSplit(filtered: string[]): NormalizedArgs {
           // A boolean flag with a value would travel as one raw token no
           // parser recognizes — `net log --redact-auth=true` would export
           // credentials unredacted and exit 0. Never legal, so no lax mode.
-          console.error(`error: flag '${name}' for '${cmd}' does not take a value (use '${name}').`)
-          process.exit(1)
+          throw new Error(`flag '${name}' for '${cmd}' does not take a value (use '${name}').`)
         }
         flags.push(tok)
         continue
@@ -263,8 +271,7 @@ export function normalizeArgsSplit(filtered: string[]): NormalizedArgs {
   if (cmd === "tab" && positionals[0] !== "new") {
     const unsupported = TAB_BOOL.find((flag) => flags.includes(flag))
     if (unsupported) {
-      console.error(`error: flag '${unsupported}' is only valid with 'tab new'.`)
-      process.exit(1)
+      throw new Error(`flag '${unsupported}' is only valid with 'tab new'.`)
     }
   }
 

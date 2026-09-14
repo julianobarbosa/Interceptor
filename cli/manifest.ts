@@ -146,7 +146,7 @@ export const COMMAND_SPECS: CommandSpec[] = [
   { name: "links", surface: "browser", usage: "interceptor links", summary: "All links on the page", returns: "Array of {text, href}." },
   { name: "images", surface: "browser", usage: "interceptor images", summary: "All images", returns: "Array of {alt, src}." },
   { name: "forms", surface: "browser", usage: "interceptor forms", summary: "All forms and fields", returns: "Form structure with field names/types/values." },
-  { name: "query", surface: "browser", usage: "interceptor query <css-selector>", summary: "Query elements by CSS selector", returns: "Matching elements with attributes and clickable e<ref>s." },
+  { name: "query", surface: "browser", usage: "interceptor query <css-selector>", summary: "Query elements by CSS selector", returns: "Total count, returned count, truncation flag, and up to 20 elements with clickable e<ref>s." },
   { name: "exists", surface: "browser", usage: "interceptor exists <css-selector>", summary: "Does a selector match?", returns: "Boolean." },
   { name: "count", surface: "browser", usage: "interceptor count <css-selector>", summary: "How many elements match", returns: "Number." },
   { name: "attr", surface: "browser", usage: "interceptor attr e<ref> <name> | attr set e<ref> <name> <value>", summary: "Get/set an attribute", returns: "Attribute value." },
@@ -159,7 +159,7 @@ export const COMMAND_SPECS: CommandSpec[] = [
   { name: "scroll", surface: "browser", usage: "interceptor scroll up|down|top|bottom [--amount <px>]", summary: "Scroll the page", returns: "ok." },
   { name: "hover", surface: "browser", usage: "interceptor hover e<ref>", summary: "Hover an element", returns: "ok." },
   { name: "drag", surface: "browser", usage: "interceptor drag e<ref> [--from x,y --to x,y --steps <n>]", summary: "Drag an element or coordinates", returns: "ok." },
-  { name: "upload", surface: "browser", usage: "interceptor upload e<ref> <path> [--dropzone] [--picker]", summary: "Attach a local file to an <input type=file>, drag-and-drop dropzone, or File System Access picker (--picker). Any size — large files auto-chunk. No CDP.", returns: "ok with {method, fileName, size, verified}. method: input | dropzone-trusted | dropzone-isolated | picker-staged." },
+  { name: "upload", surface: "browser", usage: "interceptor upload e<ref> <path> [--dropzone] [--picker]", summary: "Attach a local file to an <input type=file>, drag-and-drop dropzone, or File System Access picker (--picker). Up to 100 MB — large files auto-chunk, bigger ones are refused up front. No CDP.", returns: "ok with {method, fileName, size, verified}. method: input | dropzone-trusted | dropzone-isolated | picker-staged." },
   { name: "keepawake", surface: "browser", usage: "interceptor keepawake on|off [--display]", summary: "Keep the machine awake for an unattended run (chrome.power)", returns: "ok with {on, level}." },
   { name: "idle", surface: "browser", usage: "interceptor idle state [--interval <sec>]", summary: "Query user idle state: active | idle | locked (chrome.idle)", returns: "ok with {state}." },
   { name: "delegate", surface: "browser", usage: "interceptor delegate log [--since <ms>] [--follow]", summary: "Read human→agent delegation intents (right-click menu / hotkey)", returns: "list of delegation_intent events." },
@@ -189,13 +189,13 @@ export const COMMAND_SPECS: CommandSpec[] = [
   },
   { name: "network", surface: "browser", usage: "interceptor net [--filter <pattern>] [--limit <n>] [--format har|json|pcapng --out <path>]", summary: "Passive network log", returns: "Recent requests (method, url, status, type); exportable to HAR/pcapng." },
   { name: "headers", surface: "browser", usage: "interceptor headers [--filter <pattern>]", summary: "Request headers seen", returns: "Header sets per request." },
-  { name: "screenshot", surface: "browser", usage: "interceptor screenshot [e<ref>] [--save] [--format png|jpeg|webp] [--quality <n>]", summary: "Screenshot page/element", returns: "Image (saved to disk with --save; path on stderr)." },
-  { name: "eval", surface: "browser", usage: "interceptor eval <expr> [--main]", summary: "Evaluate JS in the page (ISOLATED world by default)", returns: "JSON-serialized expression result. Works on strict-CSP pages." },
+  { name: "screenshot", surface: "browser", usage: "interceptor screenshot [--element <ref>] [--save] [--format png|jpeg|webp] [--quality <n>]", summary: "Screenshot page/element", returns: "Image. --save takes no value and writes one auto-named file in the current directory." },
+  { name: "eval", surface: "browser", usage: "interceptor eval <expr> [--main] [--frame <id>]", summary: "Evaluate JS in the requested frame and world (isolated by default)", returns: "Expression result. Isolated eval needs userScripts support when extension CSP blocks eval. MAIN CSP recovery can reload the tab and returns {value,cspBypassApplied,originalError}; never switches world or frame." },
   { name: "save", surface: "browser", usage: "interceptor save --out <abs-path> <expr>", summary: "Stream page-produced bytes (Blob/File/ArrayBuffer) to disk", returns: "{path, bytes, sha256} — integrity-checked." },
   { name: "cookies", surface: "browser", usage: "interceptor cookies [domain] | cookies set/delete …", summary: "Read/write cookies", returns: "Cookie list." },
   { name: "storage", surface: "browser", usage: "interceptor storage [key] | storage delete <key>", summary: "localStorage access", returns: "Values." },
   { name: "override", surface: "browser", usage: "interceptor override <sub> …", summary: "Request/response overrides", returns: "Override state." },
-  { name: "monitor", surface: "browser", usage: "interceptor monitor start|stop|status|tail|export …", summary: "Record page/network/user activity into a replayable session", returns: "Session id; export produces workflow artifacts." },
+  { name: "monitor", surface: "browser", usage: "interceptor monitor start|stop|status|tail|export … | task create <objective> | task checkpoint <id> --file <json> | task resume|verify|complete <id>", summary: "Record activity or persist task constraints, resume state and declared browser checks", returns: "Recording session id or task JSON with revision, explicit target, scoped lessons and observed check results. task complete runs fresh predicates; false, missing or stale checks exit nonzero. task verify/complete execute authored JS and require MCP arbitrary-exec allowance. Verification never reloads the page." },
   { name: "scene", surface: "browser", usage: "interceptor scene <sub> …", summary: "Scene-graph automation for canvas/rich editors", returns: "Scene nodes / action results." },
   // ── local (no daemon) ───────────────────────────────────────────────────────
   {
@@ -229,7 +229,7 @@ export const COMMAND_SPECS: CommandSpec[] = [
   { name: "upgrade", surface: "local", usage: "interceptor upgrade --full", summary: "Promote browser-only install to full computer-use mode (macOS)", returns: "Installer output." },
   // ── other surfaces (verbs enumerated via their own --help) ──────────────────
   { name: "macos", surface: "macos", usage: "interceptor macos <verb> … (see: interceptor help macos)", summary: "Native macOS control: AX trees, background input, windows, screenshots, Apple Events, Electron CDP, app runtime", returns: "Per-verb; background-first — only 'app activate'/'open --activate' move focus." },
-  { name: "ios", surface: "ios", usage: "interceptor ios <verb> … (see: interceptor help ios)", summary: "iPhone automation via on-device XCUITest runner over WiFi", returns: "Per-verb: element trees, taps, typing, screenshots, app lifecycle. NOTE: 'ios devices' → connected:false is the normal idle state; the runner auto-connects on the next verb. Keep the phone unlocked & awake." },
+  { name: "ios", surface: "ios", usage: "interceptor ios <verb> … (see: interceptor help ios)", summary: "iPhone automation via on-device XCUITest runner over WiFi", returns: "Per-verb: element trees, taps, typing, screenshots, app lifecycle. NOTE: 'ios devices' → connected:false means the runner is not dialed in; the next drive verb auto-connects ('ios unlock' needs it already connected). Keep the phone unlocked & awake." },
 ]
 
 export function runManifestCommand(argv: string[]): null {

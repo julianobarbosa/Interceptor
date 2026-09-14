@@ -16,7 +16,8 @@ interceptor macos inspect                      # Tree + apps + frontmost info
 ### Self-update rules
 
 - Run `interceptor update`. Inspect `outcome`, `selectedVersion`, and `phase`.
-- If `outcome` is `checking`, run `interceptor update status`.
+- When an update is available, Sparkle's standard window shows signed cumulative notes from the target version back to, but not including, the installed version. Manual and scheduled checks use the same feed item and notes.
+- If `outcome` is `checking`, run `interceptor update status`. A live session reports `concluded: false`, `sessionAgeSeconds`, and the exact bridge restart command under `recoveryHint`.
 - If `outcome` is `update_available`, run `interceptor macos read --app interceptor-bridge`, then act on **Install Update**.
 - After download, read the changed alert for a fresh ref, then act on **Install and Relaunch**.
 - When macOS requests administrator authentication and the operator stored a secret for it, fill it: `interceptor macos authdialog status` to see the prompt, then `interceptor macos authdialog fill --secret <name> --submit`. With no stored secret, stop and tell the user which secret to register.
@@ -158,11 +159,11 @@ Runs against `OSLogStore.local()` — system-wide.
 ```bash
 interceptor macos fs read <path>
 interceptor macos fs write <path> <content>
-interceptor macos fs search --scope home|workspace|granted|<absolute-path>
+interceptor macos fs search --scope home|workspace|granted|<absolute-path> [--timeout-ms N]
 interceptor macos files watch --watch-path <p>
 ```
 
-Unresolvable scopes return an explicit error.
+Unresolvable scopes return an explicit error. Spotlight passes run under a deadline (`--timeout-ms`, default 10000): a result with `partial: true` means the deadline cut a pass; narrow `--scope` or `--kinds`, or raise the deadline.
 
 ## URL Fetch
 

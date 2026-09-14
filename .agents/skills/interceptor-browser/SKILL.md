@@ -19,29 +19,35 @@ This installed skill is self-contained. Source checkouts also have `AGENTS.md`, 
 - Supported agent shells get a soft per-session group automatically, labeled `s-<hash16>`, so bare commands reuse one tab per session and the idle sweeper has a cleanup unit. `INTERCEPTOR_SESSION_ID` is the harness-neutral contract; Interceptor also detects verified Maestro, Claude Code, and Codex session variables. Soft scope falls back to the active managed tab when the session group is empty. `--shared-group` (or empty `INTERCEPTOR_GROUP=`) explicitly uses Interceptor's shared default group; it does not remove managed grouping. **Concurrent lanes often share one host session id**, so give each lane a unique `--group lane-<n>` or `INTERCEPTOR_SESSION_ID`. Explicit `--group <label>` and non-empty `INTERCEPTOR_GROUP` provide hard isolation by default: resolution stays within that group and cross-group targets are rejected unless `--any-tab` is explicitly authorized. `interceptor group list` shows the automatic label.
 - Close your group with `interceptor group close <label>` when the job is done. The extension auto-closes groups after 10 minutes without tab activity by default; metadata polls such as `status` and `group list` do not keep a group alive. The timeout is configurable in the extension popup and is crash safety, not a substitute for cleanup.
 - In a named group, including an automatic session group, `open` navigates the group's most-recent tab by default (address-bar semantics; the reused tab stays in the background unless you add `--activate`). Pass `--no-reuse` when you need to keep the current page and open another, for example before comparing two pages or fanning out. `tab new` creates by default; explicit `--reuse` navigates the group's most-recent tab. Shared-default `open` creates by default.
-- `interceptor open <url>` and `interceptor tab new <url>` create background tabs by default. Only `open --activate`, `tab new --activate`, `tab switch <id>`, and `window focus <id>` intentionally move browser focus.
+- `interceptor open <url>` and `interceptor tab new <url>` create background tabs by default. Only `open --activate`, `tab new --activate`, `tab switch <id>`, and `window focus <id>` intentionally move browser focus. New tabs are created in the window that already holds Interceptor groups (the caller's own group's window first), not the window the user is focused on; the `tab new`/`open` result carries `windowId`.
 - If multiple browser profiles are connected, run `interceptor contexts` and pass `--context <id>`.
 - Safari registers as the stable context `safari`; route with `interceptor --context safari <verb>`. If it is absent, verify the notarized Interceptor Safari extension is enabled before attempting page commands. Safari's enable switch is a protected user-present action; never try to bypass its Touch ID/password gate.
 - Prefer structured reads (`read`, `tree`, `text`, `inspect`, `scene`) before screenshots. Open `references/screenshot-policy.md` before screenshot-heavy work.
 - Passwords and passcodes are typed by name from the keychain-backed vault: `interceptor type <ref> --secret <name>`. The daemon checks the tab's host against the secret's allowlist (`browser:<host>`) and the monitor records `***SECURE***`. Never put a credential in a literal `type` call or ask the user to paste one into chat; ask them to run `interceptor macos secret register <name> --target browser:<host>`.
+- If the password is already saved in a Chromium browser (Chrome, Brave, Vivaldi, Edge, Chromium, Arc), skip registration and fill it straight from that browser's store: `interceptor type <ref> --browser-login <host> [--user] [--browser <key>]` (password by default, username with `--user`; `--browser` restricts to one browser, default searches all installed). The daemon reads and decrypts the saved login; the requested host must match the live tab, so a page only ever fills its own credential. `interceptor browser creds list [--host <host>] [--browser <key>]` shows which hosts have a saved login (host + username + browser only, no passwords). macOS only; the value never reaches argv, logs, or your output.
 - Default to plain text output. Use `--json` only when piping into scripts or when a downstream tool needs a machine-readable contract.
 - Unknown flags are rejected (exit 1, naming the flag and command) rather than ignored, so a typo never reads as success; `screenshot` writes to disk with `--save`, not `--out`. Fix the flag instead of setting `INTERCEPTOR_LAX_FLAGS=1`.
 - A verb whose result is a failure prints `error: …` and exits non-zero (every browser verb, including `back`/`forward` with no history). Check `$?` in scripts; do not grep stdout for `error:` to detect failure.
-- If an already-loaded unpacked extension behaves stale after a package update, reload it from `chrome://extensions` or `brave://extensions`, or run `interceptor reload` once the extension is reachable.
+- `eval --main` can recover from strict CSP by stripping the blocking header and reloading the tab. The result discloses that reload. Treat it as state-changing because unsaved page state can be lost; task verification disables this recovery.
+- If the extension behaves stale after a package update, run `interceptor reload --context <id>`: an unpacked copy picks up the installed files; a Chrome Web Store copy only asks the store for an update and keeps its version until the store publishes the new one. `interceptor contexts --verbose` shows which copy (store or unpacked) and version each context runs.
 - Safari package updates are loaded through the containing app/appex; do not look for a Chrome-style unpacked-extension reload button.
 - Safari suspends its background worker when idle, so `--context safari` can briefly report "context 'safari' not found" between commands and then self-heal. Re-issue the command rather than treating one transient drop as failure. Note two Safari capability limits: `headers add` only modifies recognized standard headers (arbitrary `X-…` names are refused — use `override` instead), and passive `net` capture reflects genuine page traffic, not requests you originate from `eval` (its world is separate from the page's).
 
 ## Fast Path
 
 ```bash
-interceptor status                        # 1. Confirm daemon + extension are alive
+interceptor contexts                      # 0. Browser profiles connected. More than one? Pick the lane's once:
+export INTERCEPTOR_CONTEXT=<id>           #    (or pass --context <id> on every call; the flag overrides the env)
+interceptor status --verbose              # 1. Daemon + extension alive per context; eval --main availability
 interceptor websearch "example docs"      # 2a. Default provider → managed background results tab
-interceptor open "https://example.com"    # 2b. Or open a known URL → wait + tree + text
+interceptor open "https://example.com" --tree-format compact   # 2b. Or open a known URL → wait + compact tree + text
 interceptor read                          # 3. Current state (re-read after any mutation)
 interceptor act e5                        # 4. Click ref e5 (refs come from `read`)
 interceptor act e7 "example user"         # 5. Type into ref e7
 interceptor inspect                       # 6. Tree + text + network in one read
 ```
+
+If your harness truncates tool results, also set `INTERCEPTOR_TREE_MAX_CHARS` / `INTERCEPTOR_TEXT_MAX_CHARS` once (defaults 50000 / 8000); a truncated tree or text ends in a marker that says how to scope or widen. A `stale element [eN]` error means the element left the DOM and nothing was clicked or typed; refs never re-bind to look-alike elements, so `read` again. A `timeout … The outcome is unknown` means the action may still land; `read` before retrying it.
 
 Inside this repo without `interceptor` on PATH, use `./dist/interceptor ...`.
 
@@ -55,6 +61,7 @@ Each workflow is a complete self-contained "you are doing X" procedure. Open the
 | [`workflows/read-and-extract.md`](workflows/read-and-extract.md) | Compound page read + SPA state extraction — pull a specific value off a page |
 | [`workflows/drive-rich-editor.md`](workflows/drive-rich-editor.md) | Canva, Google Docs, Google Slides, design-tool layer manipulation — anything where DOM refs aren't enough |
 | [`workflows/rich-editor-workflows.md`](workflows/rich-editor-workflows.md) | Canva shape insertion, Docs table build+fill, Slides table insert — what works natively vs the `eval --main` last mile |
+| [`workflows/task-state.md`](workflows/task-state.md) | Durable task checkpoints, scoped lessons, compact resume and fresh browser completion checks |
 | [`workflows/google-docs-fill-empty-table-cells.md`](workflows/google-docs-fill-empty-table-cells.md) | Fill empty Docs table cells with the value above (canvas caret + per-char typing + Tab) |
 | [`workflows/canva-custom-size-creation.md`](workflows/canva-custom-size-creation.md) | Create a custom-size Canva design from home (normalized semantic replay) + monitor launch/handoff pattern |
 | [`workflows/cook-in-canvas.md`](workflows/cook-in-canvas.md) | Draw effects/markers directly through a page's own `CanvasRenderingContext2D` (Docs/Excalidraw), pixel-verified |

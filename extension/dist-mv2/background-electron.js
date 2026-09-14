@@ -58,6 +58,12 @@ async function isTabInNormalWindow(tabId) {
     return true;
   }
 }
+async function createGroupInTabWindow(tabId) {
+  const tab = await chrome.tabs.get(tabId).catch(() => {
+    return;
+  });
+  return chrome.tabs.group(tab?.windowId !== undefined ? { tabIds: tabId, createProperties: { windowId: tab.windowId } } : { tabIds: tabId });
+}
 var GROUP_LABEL_RE = /^[A-Za-z0-9_-]{1,32}$/;
 var SESSION_NAMED_GROUPS_KEY = "namedTabGroups";
 var namedGroups = new Map;
@@ -144,7 +150,7 @@ async function addTabToNamedGroupSerialized(tabId, label, colorOverride) {
   let groupId = await ensureNamedGroup(label);
   try {
     if (groupId === -1) {
-      groupId = await chrome.tabs.group({ tabIds: tabId });
+      groupId = await createGroupInTabWindow(tabId);
       const color = typeof colorOverride === "string" && VALID_COLORS.includes(colorOverride) ? normalizeColor(colorOverride) : colorForLabel(label);
       await chrome.tabGroups.update(groupId, {
         title: groupTitleFor(label),
@@ -187,6 +193,30 @@ async function isTabInAnyManagedGroup(tabId) {
 }
 function anyManagedGroupKnown() {
   return interceptorGroupId !== null || namedGroups.size > 0;
+}
+async function managedGroupWindows(label) {
+  const hosting = new Map;
+  let own;
+  if (!hasTabGroupApi())
+    return { hosting };
+  try {
+    await hydrateNamedGroups();
+    const candidates = await getCandidateTitles();
+    const prefix = groupTitleFor("");
+    const groups = await chrome.tabGroups.query({}).catch(() => []);
+    for (const g of groups) {
+      const title = typeof g.title === "string" ? g.title : "";
+      const isDefault = g.id === interceptorGroupId || candidates.includes(title);
+      const isNamed = labelForGroupId(g.id) !== null || title.startsWith(prefix) && GROUP_LABEL_RE.test(title.slice(prefix.length));
+      if (!isDefault && !isNamed)
+        continue;
+      hosting.set(g.windowId, (hosting.get(g.windowId) ?? 0) + 1);
+      const isOwn = label ? namedGroups.get(label) === g.id || title === groupTitleFor(label) : isDefault;
+      if (isOwn && own === undefined)
+        own = g.windowId;
+    }
+  } catch {}
+  return { own, hosting };
 }
 function labelForGroupId(groupId) {
   for (const [label, gid] of namedGroups) {
@@ -237,7 +267,7 @@ async function addTabToInterceptorGroupSerialized(tabId) {
     return -1;
   try {
     if (groupId === -1) {
-      groupId = await chrome.tabs.group({ tabIds: tabId });
+      groupId = await createGroupInTabWindow(tabId);
       await chrome.tabGroups.update(groupId, {
         title: getTabGroupTitle(),
         color: getTabGroupColor()
@@ -272,10 +302,11 @@ async function verifyTabUrl(tabId, expectedUrl) {
 }
 
 // shared/content-script-retry.ts
+var REPLY_CHANNEL_CLOSED = /message (?:port|channel) (?:is )?closed/i;
 function shouldRetryContentScript(error) {
   if (!error)
     return false;
-  return error.includes("Receiving end does not exist") || error.includes("Could not establish connection") || error.includes("disconnected port") || error.includes("message channel is closed") || error.includes("no response from content script");
+  return error.includes("Receiving end does not exist") || error.includes("Could not establish connection") || error.includes("disconnected port") || REPLY_CHANNEL_CLOSED.test(error) || error.includes("no response from content script");
 }
 var INPUT_ACTIONS = new Set([
   "click",
@@ -301,7 +332,7 @@ var INPUT_ACTIONS = new Set([
 function isResponseLoss(error) {
   if (!error)
     return false;
-  return error.includes("message channel is closed") || error.includes("disconnected port") || error.includes("no response from content script");
+  return REPLY_CHANNEL_CLOSED.test(error) || error.includes("disconnected port") || error.includes("no response from content script");
 }
 
 // extension/src/background/content-bridge.ts
@@ -385,26 +416,17 @@ async function sendToContentScript(tabId, action, frameId) {
   const first = await sendToContentScriptOnce(tabId, action, frameId);
   if (first.success || !shouldRetryContentScript(first.error))
     return first;
-  if (INPUT_ACTIONS.has(action.type) && isResponseLoss(first.error)) {
-    let navigating = false;
-    try {
-      navigating = (await chrome.tabs.get(tabId)).status === "loading";
-    } catch {}
-    if (navigating) {
-      return {
-        success: true,
-        data: `${action.type} delivered; the page began navigating before the reply arrived`,
-        warning: "reply channel closed during navigation — re-read page state to confirm the outcome"
-      };
-    }
-    return {
-      success: false,
-      error: `${action.type} was delivered but the reply channel closed (${first.error}) — not auto-retried to avoid firing it twice; re-read page state to confirm the outcome, then retry deliberately`
-    };
-  }
+  const firstGuard = await inputReplayGuard(tabId, action, first);
+  if (firstGuard)
+    return firstGuard;
   await new Promise((resolve) => setTimeout(resolve, 250));
   const retryWithoutInject = await sendToContentScriptOnce(tabId, action, frameId);
   if (retryWithoutInject.success)
+    return retryWithoutInject;
+  const secondGuard = await inputReplayGuard(tabId, action, retryWithoutInject);
+  if (secondGuard)
+    return secondGuard;
+  if (!shouldRetryContentScript(retryWithoutInject.error))
     return retryWithoutInject;
   const injected = await injectContentScript(tabId, frameId);
   if (!injected.success) {
@@ -422,9 +444,31 @@ async function sendToContentScript(tabId, action, frameId) {
   const retried = await sendToContentScriptOnce(tabId, action, frameId);
   if (retried.success)
     return retried;
+  const thirdGuard = await inputReplayGuard(tabId, action, retried);
+  if (thirdGuard)
+    return thirdGuard;
   return {
     success: false,
     error: `content script re-injected on tab ${tabId} but action still failed: ${retried.error || "unknown error"}`
+  };
+}
+async function inputReplayGuard(tabId, action, attempt) {
+  if (attempt.success || !INPUT_ACTIONS.has(action.type) || !isResponseLoss(attempt.error))
+    return null;
+  let navigating = false;
+  try {
+    navigating = (await chrome.tabs.get(tabId)).status === "loading";
+  } catch {}
+  if (navigating) {
+    return {
+      success: true,
+      data: `${action.type} delivered; the page began navigating before the reply arrived`,
+      warning: "reply channel closed during navigation — re-read page state to confirm the outcome"
+    };
+  }
+  return {
+    success: false,
+    error: `${action.type} was delivered but the reply channel closed (${attempt.error}) — not auto-retried to avoid firing it twice; re-read page state to confirm the outcome, then retry deliberately`
   };
 }
 async function sendNetDirect(tabId, msg) {
@@ -839,13 +883,33 @@ function mimeTypeForFormat(format) {
     return "image/png";
   return "image/jpeg";
 }
+var captureQueueByWindow = new Map;
 async function withCaptureVisibleTabFocus(tabId, windowId, fn) {
+  const tail = captureQueueByWindow.get(windowId) ?? Promise.resolve();
+  const run = tail.catch(() => {
+    return;
+  }).then(() => borrowFocusAndCapture(tabId, windowId, fn));
+  captureQueueByWindow.set(windowId, run);
+  try {
+    return await run;
+  } finally {
+    if (captureQueueByWindow.get(windowId) === run)
+      captureQueueByWindow.delete(windowId);
+  }
+}
+async function borrowFocusAndCapture(tabId, windowId, fn) {
   const [priorActive] = await chrome.tabs.query({ active: true, windowId });
   const targetAlreadyActive = priorActive?.id === tabId;
   if (!targetAlreadyActive) {
     try {
       await chrome.tabs.update(tabId, { active: true });
-    } catch {}
+    } catch (err) {
+      throw new Error(`could not activate tab ${tabId} for capture: ${err.message}. captureVisibleTab reads the window's active tab, so capturing anyway would return a different page; retry, or pass --tab <id> of a tab that can be activated.`);
+    }
+    const [nowActive] = await chrome.tabs.query({ active: true, windowId });
+    if (nowActive?.id !== tabId) {
+      throw new Error(`tab ${tabId} did not become the active tab of window ${windowId} (active is ${nowActive?.id ?? "none"}); refusing to capture a different page.`);
+    }
   }
   try {
     return await fn();
@@ -1989,12 +2053,17 @@ function groupWarningFor(groupId, groupApiAvailable) {
   }
   return;
 }
-async function resolveNormalWindowPlacement(focusNew, url) {
+async function resolveNormalWindowPlacement(focusNew, url, group) {
   if (!chrome.windows || typeof chrome.windows.getAll !== "function")
     return {};
   try {
     const normal = await chrome.windows.getAll({ windowTypes: ["normal"] });
-    const existing = normal.find((w) => w.focused)?.id ?? normal[0]?.id;
+    const home = await managedGroupWindows(group);
+    if (home.own !== undefined && normal.some((w) => w.id === home.own))
+      return { windowId: home.own };
+    const hosting = normal.filter((w) => w.id !== undefined && home.hosting.has(w.id)).sort((a, b) => (home.hosting.get(b.id) ?? 0) - (home.hosting.get(a.id) ?? 0));
+    const pool = hosting.length > 0 ? hosting : normal;
+    const existing = pool.find((w) => w.focused)?.id ?? pool[0]?.id;
     if (existing !== undefined)
       return { windowId: existing };
     if (typeof chrome.windows.create === "function") {
@@ -2043,7 +2112,7 @@ async function handleTabActions(action, tabId) {
                 await sessionArea4().set({ [activeTabKey(group)]: candidate.id });
                 return {
                   success: true,
-                  data: { tabId: candidate.id, url: updated?.url ?? targetUrl, groupId, group, reused: true }
+                  data: { tabId: candidate.id, url: updated?.url ?? targetUrl, windowId: updated?.windowId ?? candidate.windowId, groupId, group, reused: true }
                 };
               } catch {}
             }
@@ -2051,7 +2120,7 @@ async function handleTabActions(action, tabId) {
         }
       }
       const shouldActivate = action.active === true;
-      const placement = await resolveNormalWindowPlacement(shouldActivate, targetUrl);
+      const placement = await resolveNormalWindowPlacement(shouldActivate, targetUrl, group);
       const newTab = placement.createdTab ?? await chrome.tabs.create({
         url: targetUrl,
         active: shouldActivate,
@@ -2062,7 +2131,7 @@ async function handleTabActions(action, tabId) {
         if (shouldActivate)
           await chrome.tabs.update(newTab.id, { active: true });
         await sessionArea4().set({ [activeTabKey(group)]: newTab.id });
-        const data = { tabId: newTab.id, url: newTab.url, groupId, group, reused: false };
+        const data = { tabId: newTab.id, url: newTab.url, windowId: newTab.windowId, groupId, group, reused: false };
         const groupWarning = groupWarningFor(groupId, hasTabGroupApi());
         if (groupWarning)
           data.groupWarning = groupWarning;
@@ -2714,33 +2783,86 @@ function buildCspBypassRule(tabId) {
     }
   };
 }
-async function executeWithUserScripts(tabId, world, code) {
+var USER_SCRIPT_CLONE = `const __c=v=>{if(v==null)return v;const t=typeof v;if(t==="string"||t==="number"||t==="boolean")return v;if(t==="bigint")return v.toString();try{return JSON.parse(JSON.stringify(v))}catch{try{return String(v)}catch{return null}}};`;
+var USER_SCRIPT_CATCH = `catch(e){return{__ik:1,ok:false,error:String(e&&e.message||e)}}`;
+var USER_SCRIPT_RAN_KEY = "interceptor.eval.ran";
+function userScriptForms(code, nonce) {
+  const key = `Symbol.for(${JSON.stringify(USER_SCRIPT_RAN_KEY)})`;
+  return {
+    expression: `(async()=>{${USER_SCRIPT_CLONE}try{return{__ik:1,ok:true,value:__c(await (async()=>(
+${code}
+))())}}${USER_SCRIPT_CATCH}})()`,
+    statement: `globalThis[${key}]=${JSON.stringify(nonce)};try{
+${code}
+}catch(e){({__ik:1,ok:false,error:String(e&&e.message||e)})}`,
+    probe: `(()=>{const k=${key};const r=globalThis[k];delete globalThis[k];return r===${JSON.stringify(nonce)}})()`,
+    asyncBody: `(async()=>{${USER_SCRIPT_CLONE}try{
+${code}
+;return{__ik:1,ok:true}}${USER_SCRIPT_CATCH}})()`
+  };
+}
+var USER_SCRIPT_SYNTAX_ERROR = "SyntaxError: the code did not parse as an expression or as statements (or returned a value the browser could not serialize). Check quoting; multi-statement code that needs await should end with `return <value>`.";
+function unwrapUserScriptResult(raw) {
+  const r = raw;
+  if (r && typeof r === "object" && r.__ik === 1) {
+    return r.ok ? { success: true, data: r.value } : { success: false, error: r.error ?? "eval failed" };
+  }
+  return { success: true, data: raw };
+}
+async function executeWithUserScripts(tabId, world, code, frameId) {
   try {
     if (!chrome.userScripts || typeof chrome.userScripts.execute !== "function") {
-      return { available: false };
+      return { available: false, reason: "chrome.userScripts.execute is unavailable (check Allow User Scripts and browser support)" };
     }
-    const results = await chrome.userScripts.execute({
-      target: { tabId },
-      js: [{ code }],
-      world
-    });
-    const first = results[0];
-    if (!first)
-      return { available: true, result: { success: false, error: "no result" } };
-    if (first.error)
-      return { available: true, result: { success: false, error: first.error } };
-    return { available: true, result: { success: true, data: first.result } };
+    const forms = userScriptForms(code, crypto.randomUUID());
+    const run = async (js) => {
+      const results = await chrome.userScripts.execute({
+        target: { tabId, ...frameId !== undefined ? { frameIds: [frameId] } : {} },
+        js: [{ code: js }],
+        world
+      });
+      return frameId === undefined ? results[0] : results.find((r) => r.frameId === frameId) ?? (results.length === 1 && results[0]?.frameId === undefined ? results[0] : undefined);
+    };
+    const settled = (first2) => {
+      if (!first2)
+        return { available: true, result: { success: false, error: `no result for frame ${frameId ?? 0}` } };
+      if (first2.error)
+        return { available: true, result: { success: false, error: first2.error } };
+      return;
+    };
+    let first = await run(forms.expression);
+    let done = settled(first);
+    if (done)
+      return done;
+    if (first.result !== undefined && first.result !== null)
+      return { available: true, result: unwrapUserScriptResult(first.result) };
+    first = await run(forms.statement);
+    done = settled(first);
+    if (done)
+      return done;
+    if (first.result !== undefined && first.result !== null)
+      return { available: true, result: unwrapUserScriptResult(first.result) };
+    const ran = await run(forms.probe);
+    if (ran?.result === true)
+      return { available: true, result: { success: true, data: first.result } };
+    first = await run(forms.asyncBody);
+    done = settled(first);
+    if (done)
+      return done;
+    if (first.result !== undefined && first.result !== null)
+      return { available: true, result: unwrapUserScriptResult(first.result) };
+    return { available: true, result: { success: false, error: USER_SCRIPT_SYNTAX_ERROR } };
   } catch (err) {
     const message = err.message || String(err);
     if (/userScripts|Developer mode|Allow User Scripts|permission|undefined/i.test(message)) {
-      return { available: false };
+      return { available: false, reason: message };
     }
     return { available: true, result: { success: false, error: message } };
   }
 }
-async function executeEval(tabId, world, code) {
+async function executeEval(tabId, world, code, frameId) {
   const results = await chrome.scripting.executeScript({
-    target: { tabId },
+    target: { tabId, ...frameId !== undefined ? { frameIds: [frameId] } : {} },
     world,
     args: [code, IK_TT_POLICY, TT_POLICY_NAME],
     func: async (c, ttKey, ttName) => {
@@ -2794,7 +2916,8 @@ async function executeEval(tabId, world, code) {
       }
     }
   });
-  return results[0]?.result ?? { success: false, error: "no result" };
+  const first = frameId === undefined ? results[0] : results.find((r) => r.frameId === frameId) ?? (results.length === 1 && results[0]?.frameId === undefined ? results[0] : undefined);
+  return first?.result ?? { success: false, error: `no result for frame ${frameId ?? 0}` };
 }
 async function installCspBypassForTab(tabId) {
   const rule = buildCspBypassRule(tabId);
@@ -2812,19 +2935,6 @@ async function runWithCspStripBypass(tabId, world, run) {
   if (first.success || world !== "MAIN") {
     return first;
   }
-  if (isTrustedTypesError(first.error) && !isCspUnsafeEvalError(first.error)) {
-    const isolated = await run(tabId, "ISOLATED");
-    if (isolated.success) {
-      return {
-        ...isolated,
-        data: {
-          value: isolated.data,
-          trustedTypesFallback: true,
-          originalError: first.error
-        }
-      };
-    }
-  }
   if (!isCspUnsafeEvalError(first.error) && !isTrustedTypesError(first.error)) {
     return first;
   }
@@ -2838,7 +2948,12 @@ async function runWithCspStripBypass(tabId, world, run) {
       data: { originalError: first.error, cspBypassAttempted: false }
     };
   }
-  const retried = await run(tabId, "MAIN");
+  let retried;
+  try {
+    retried = await run(tabId, "MAIN");
+  } catch (err) {
+    retried = { success: false, error: err instanceof Error ? err.message : String(err) };
+  }
   if (retried.success) {
     return {
       ...retried,
@@ -2863,20 +2978,31 @@ async function handleEvaluateActions(action, tabId) {
     return { success: false, error: `unknown evaluate action: ${action.type}` };
   }
   const code = action.code;
+  const frameId = action.frameId;
+  if (frameId !== undefined && (!Number.isSafeInteger(frameId) || frameId < 0)) {
+    return { success: false, error: "frameId must be a non-negative safe integer" };
+  }
+  if (typeof code !== "string" || !code.trim())
+    return { success: false, error: "evaluate requires JavaScript code" };
   const world = action.world === "ISOLATED" ? "ISOLATED" : "MAIN";
   const initialUserScriptWorld = world === "MAIN" ? "MAIN" : "USER_SCRIPT";
-  const userScriptAttempt = await executeWithUserScripts(tabId, initialUserScriptWorld, code);
-  if (userScriptAttempt.available) {
-    if (!userScriptAttempt.result?.success && world === "MAIN" && isCspEvalError(userScriptAttempt.result?.error)) {
-      const fallback = await executeWithUserScripts(tabId, "USER_SCRIPT", code);
-      if (fallback.available && (fallback.result?.success || !isCspEvalError(fallback.result?.error))) {
-        return fallback.result ?? { success: false, error: "no result" };
-      }
-    } else {
-      return userScriptAttempt.result ?? { success: false, error: "no result" };
-    }
+  const userScriptAttempt = await executeWithUserScripts(tabId, initialUserScriptWorld, code, frameId);
+  if (userScriptAttempt.available && (world !== "MAIN" || !isCspEvalError(userScriptAttempt.result?.error))) {
+    return userScriptAttempt.result ?? { success: false, error: "no result" };
   }
-  return runWithCspStripBypass(tabId, world, (t, w) => executeEval(t, w, code));
+  try {
+    const result = action.noCspReload === true ? await executeEval(tabId, world, code, frameId) : await runWithCspStripBypass(tabId, world, (t, w) => executeEval(t, w, code, frameId));
+    if (!result.success && world === "ISOLATED" && isCspEvalError(result.error)) {
+      return {
+        success: false,
+        error: `Isolated eval is unavailable: ${userScriptAttempt.reason ?? "the userScripts execution failed"}. Enable Allow User Scripts for this extension and reload it, or explicitly use eval --main for page-world access.`,
+        data: { originalError: result.error, requestedWorld: world, userScriptsAvailable: userScriptAttempt.available }
+      };
+    }
+    return result;
+  } catch (err) {
+    return { success: false, error: `eval in frame ${frameId ?? 0} failed: ${err.message}` };
+  }
 }
 
 // extension/src/background/capabilities/binary-sink.ts
@@ -3524,6 +3650,35 @@ async function handleFrameActions(action, tabId, sendFrame = sendToContentScript
 }
 
 // extension/src/background/capabilities/meta.ts
+async function requestStoreUpdate(waitMs = 8000) {
+  const runtime = chrome.runtime;
+  const requestUpdateCheck = runtime.requestUpdateCheck;
+  if (typeof requestUpdateCheck !== "function")
+    return { updateCheck: "unavailable" };
+  let result;
+  try {
+    result = await chromeCall((cb) => requestUpdateCheck.call(runtime, cb), (a, b) => typeof a === "string" ? { status: a, version: b?.version } : a);
+  } catch (err) {
+    return { updateCheck: `error: ${err.message || String(err)}` };
+  }
+  const onUpdateAvailable = runtime.onUpdateAvailable;
+  if (result.status !== "update_available" || !onUpdateAvailable) {
+    return { updateCheck: result.status, ...result.version ? { updateVersion: result.version } : {} };
+  }
+  const version = await new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      onUpdateAvailable.removeListener(cb);
+      resolve(result.version);
+    }, waitMs);
+    const cb = (d) => {
+      clearTimeout(timer);
+      onUpdateAvailable.removeListener(cb);
+      resolve(d.version);
+    };
+    onUpdateAvailable.addListener(cb);
+  });
+  return { updateCheck: "update_available", ...version ? { updateVersion: version } : {} };
+}
 async function handleMetaActions(action, tabId) {
   switch (action.type) {
     case "status": {
@@ -3541,9 +3696,25 @@ async function handleMetaActions(action, tabId) {
         }
       };
     }
-    case "reload_extension":
+    case "reload_extension": {
+      const installType = await detectInstallType();
+      if (installType && installType !== "development") {
+        const check = await requestStoreUpdate();
+        setTimeout(() => chrome.runtime.reload(), 100);
+        return { success: true, data: { installType, ...check, reloading: true } };
+      }
       setTimeout(() => chrome.runtime.reload(), 100);
       return { success: true, data: "reloading in 100ms" };
+    }
+    case "context_set": {
+      const name = typeof action.name === "string" ? action.name.trim() : "";
+      if (!name)
+        return { success: false, error: "context_set requires a nonempty name" };
+      setTimeout(() => {
+        chrome.storage.local.set({ contextId: name }).catch((err) => console.error("context_set failed:", err));
+      }, 100);
+      return { success: true, data: { contextId: name } };
+    }
     case "capabilities": {
       const daemonConnected = activeTransport !== "none";
       const hasDebugger = chrome.runtime.getManifest().permissions?.includes("debugger") ?? false;
@@ -4763,7 +4934,7 @@ var EVALUATE_ACTIONS = new Set(["evaluate"]);
 var BINARY_SINK_ACTIONS = new Set(["binary_sink_save"]);
 var STYLE_ACTIONS = new Set(["style_inject", "style_remove"]);
 var FRAME_ACTIONS = new Set(["frames_list", "frames_read_tree", "frames_find"]);
-var META_ACTIONS = new Set(["status", "reload_extension", "capabilities", "cdp_tree", "brand_set_tab_group"]);
+var META_ACTIONS = new Set(["status", "reload_extension", "capabilities", "cdp_tree", "brand_set_tab_group", "context_set"]);
 var PASSIVE_NET_ACTIONS = new Set([
   "net_log",
   "net_clear",
@@ -4879,6 +5050,14 @@ async function routeAction(action, tabId) {
         tabId
       };
     }
+    const guardRefused = action.os !== true && !!(typeof osResult.data === "object" && osResult.data && osResult.data.hint);
+    if (guardRefused) {
+      return {
+        ...contentResult,
+        warning: `${contentResult.warning}; OS-level escalation skipped: ${osResult.error}`,
+        tabId
+      };
+    }
     return {
       success: false,
       error: "click failed at all layers",
@@ -4909,6 +5088,7 @@ async function routeAction(action, tabId) {
 var NO_TAB_ACTIONS = new Set([
   "status",
   "reload_extension",
+  "context_set",
   "tab_create",
   "tab_list",
   "window_create",
@@ -5357,6 +5537,8 @@ var nativeReconnectTimer = null;
 var wsReconnectTimer = null;
 var wsChannel = null;
 var wsReady = false;
+var lastNativeError;
+var safariNativeConnecting = false;
 var wsKeepalive = { keepalivesSinceAck: 0, ackSupported: false };
 var wsKeepAliveTimer = null;
 var keepalivePongTimer = null;
@@ -5371,6 +5553,29 @@ var safariNativeRelayClient = null;
 var WS_KEEPALIVE_MISS_LIMIT = 2;
 var OUTBOUND_RECOVERY_QUEUE_CAP = 50;
 var outboundRecoveryQueue = [];
+function connectionSnapshot() {
+  if (activeTransport !== "none") {
+    return { state: "connected", transport: activeTransport };
+  }
+  const wsConnecting = !!wsChannel && wsChannel.readyState === WebSocketImpl.CONNECTING;
+  if (isConnecting || wsConnecting || safariNativeConnecting)
+    return { state: "connecting" };
+  return { state: "disconnected", ...lastNativeError ? { nativeError: lastNativeError } : {} };
+}
+function nativeErrorMessage(error) {
+  if (error instanceof Error)
+    return error.message;
+  if (typeof error === "string")
+    return error;
+  if (error && typeof error === "object" && typeof error.message === "string") {
+    return error.message;
+  }
+  return;
+}
+function markTransportSucceeded(transport) {
+  activeTransport = transport;
+  lastNativeError = undefined;
+}
 function describeOutboundMessage(msg) {
   const candidate = msg;
   if (candidate && typeof candidate.id === "string") {
@@ -5432,7 +5637,7 @@ function markWsRegistered() {
   wsReady = true;
   clearContextConflictBadge(chrome);
   if (activeTransport !== "native") {
-    activeTransport = "websocket";
+    markTransportSucceeded("websocket");
     wsReconnectDelay = INITIAL_RECONNECT_DELAY_MS;
     isConnecting = false;
     console.log("connection ready via ws channel");
@@ -5458,10 +5663,53 @@ function extensionVersion() {
     return;
   }
 }
-function sendWsRegistration(ws, contextId) {
-  markWsUnregistered();
+var cachedInstallType;
+function chromeCall(invoke, map) {
+  return new Promise((resolve, reject) => {
+    const ret = invoke((...args) => {
+      const err = chrome.runtime?.lastError?.message;
+      if (err)
+        reject(new Error(err));
+      else
+        resolve(map(...args));
+    });
+    if (ret && typeof ret.then === "function") {
+      ret.then((v) => resolve(map(v)), reject);
+    }
+  });
+}
+async function detectInstallType() {
+  if (cachedInstallType)
+    return cachedInstallType;
+  const management = chrome.management;
+  const getSelf = management?.getSelf;
+  if (typeof getSelf !== "function")
+    return;
   try {
-    ws.send(JSON.stringify({ type: "extension", contextId, version: extensionVersion() }));
+    const info = await chromeCall((cb) => getSelf.call(management, cb), (i) => i);
+    if (typeof info?.installType === "string")
+      cachedInstallType = info.installType;
+  } catch {}
+  return cachedInstallType;
+}
+async function extensionIdentity() {
+  let extensionId;
+  try {
+    extensionId = typeof chrome.runtime.id === "string" ? chrome.runtime.id : undefined;
+  } catch {}
+  return { version: extensionVersion(), extensionId, installType: await detectInstallType() };
+}
+var wsRegistrationSeq = 0;
+async function sendWsRegistration(ws, contextId) {
+  markWsUnregistered();
+  const seq = ++wsRegistrationSeq;
+  const identity = await extensionIdentity();
+  if (seq !== wsRegistrationSeq)
+    return true;
+  if (wsChannel !== ws || ws.readyState !== WebSocketImpl.OPEN)
+    return false;
+  try {
+    ws.send(JSON.stringify({ type: "extension", contextId, ...identity }));
     return true;
   } catch (err) {
     console.error("ws context registration send error:", err);
@@ -5559,7 +5807,7 @@ function connectToHost() {
   }
   if (!hasNativeMessaging()) {
     if (isWsOpen())
-      activeTransport = "websocket";
+      markTransportSucceeded("websocket");
     else
       connectWsChannel();
     return;
@@ -5567,9 +5815,18 @@ function connectToHost() {
   if (nativePort || isConnecting)
     return;
   isConnecting = true;
-  const port = chrome.runtime.connectNative("com.interceptor.host");
+  let port;
+  try {
+    port = chrome.runtime.connectNative("com.interceptor.host");
+  } catch (error) {
+    lastNativeError = nativeErrorMessage(error);
+    isConnecting = false;
+    scheduleNativeReconnect();
+    return;
+  }
   const handshakeTimer = setTimeout(() => {
     console.error("native host handshake timeout (10s)");
+    lastNativeError = "Native host handshake timed out.";
     disconnectNativePort(port);
     scheduleNativeReconnect();
   }, 1e4);
@@ -5579,7 +5836,7 @@ function connectToHost() {
       if (pendingHandshakePort === port) {
         clearTimeout(handshakeTimer);
         pendingHandshakePort = null;
-        activeTransport = "native";
+        markTransportSucceeded("native");
         nativeReconnectDelay = INITIAL_RECONNECT_DELAY_MS;
         if (nativeReconnectTimer) {
           clearTimeout(nativeReconnectTimer);
@@ -5587,7 +5844,10 @@ function connectToHost() {
         }
         isConnecting = false;
         console.log("native host connected (pong received)");
-        emitEvent("connection_established");
+        extensionIdentity().then((identity) => {
+          if (nativePort === port && activeTransport === "native")
+            emitEvent("connection_established", identity);
+        });
         drainMessageQueue();
       }
       if (keepalivePongTimer) {
@@ -5601,14 +5861,16 @@ function connectToHost() {
   });
   port.onDisconnect.addListener(() => {
     const disconnectedPort = port;
+    clearTimeout(handshakeTimer);
     isConnecting = false;
     const lastError = chrome.runtime.lastError;
+    lastNativeError = nativeErrorMessage(lastError);
     if (lastError)
       console.error("native host disconnected:", lastError.message);
     console.log("connection_lost", lastError?.message);
     clearNativeStateFor(disconnectedPort);
     if (isWsOpen()) {
-      activeTransport = "websocket";
+      markTransportSucceeded("websocket");
       console.log("native host down but ws channel active, switching to websocket");
       recoverPendingRequestsAfterNativeDisconnect(pendingRequests, (msg) => sendToHost(msg, true, true));
       pendingRequests.clear();
@@ -5623,6 +5885,7 @@ function connectToHost() {
   pendingHandshakePort = port;
   const ping = safeNativePortPing(port);
   if (!ping.posted) {
+    lastNativeError = nativeErrorMessage(ping.error);
     clearTimeout(handshakeTimer);
     clearNativeStateFor(port);
     isConnecting = false;
@@ -5637,8 +5900,11 @@ function handleControlPlaneMessage(rawMessage, transport) {
   if (controlType === "context_conflict") {
     if (transport === "websocket")
       markWsUnregistered();
-    else if (activeTransport === "safari-native")
-      activeTransport = "none";
+    else {
+      safariNativeConnecting = false;
+      if (activeTransport === "safari-native")
+        activeTransport = "none";
+    }
     console.error(`[interceptor] context name conflict: '${msg.contextId}' is already registered. Change the context ID in the extension popup.`);
     setContextConflictBadge(chrome);
     return;
@@ -5647,7 +5913,8 @@ function handleControlPlaneMessage(rawMessage, transport) {
     if (transport === "websocket") {
       markWsRegistered();
     } else {
-      activeTransport = "safari-native";
+      markTransportSucceeded("safari-native");
+      safariNativeConnecting = false;
       clearContextConflictBadge(chrome);
       drainMessageQueue();
       while (outboundRecoveryQueue.length > 0) {
@@ -5683,11 +5950,18 @@ function connectSafariNativeRelayChannel() {
     contextId,
     onMessage: (message) => handleControlPlaneMessage(message, "safari-native"),
     onConnectionChange: (connected) => {
-      if (!connected && activeTransport === "safari-native")
-        activeTransport = "none";
+      if (!connected) {
+        safariNativeConnecting = false;
+        if (activeTransport === "safari-native")
+          activeTransport = "none";
+      }
     },
-    onError: (error) => console.error("Safari native relay:", error.message)
+    onError: (error) => {
+      safariNativeConnecting = false;
+      console.error("Safari native relay:", error.message);
+    }
   });
+  safariNativeConnecting = true;
   safariNativeRelayClient.start();
 }
 function wsStateOnOpen() {
@@ -5784,7 +6058,7 @@ function connectWsChannel() {
       }
       if (ws.readyState !== WebSocketImpl.OPEN)
         return;
-      if (!sendWsRegistration(ws, contextId)) {
+      if (!await sendWsRegistration(ws, contextId)) {
         closeWsForReconnect(ws);
         return;
       }
@@ -5834,7 +6108,11 @@ function registerSwKeepaliveListener() {
   if (!onMessage?.addListener)
     return;
   onMessage.addListener((msg, _sender, sendResponse) => {
-    if (msg.type !== "sw_keepalive")
+    if (msg?.type === "interceptor_connection_status") {
+      sendResponse(connectionSnapshot());
+      return false;
+    }
+    if (msg?.type !== "sw_keepalive")
       return false;
     const now = Date.now();
     if (now - lastSwKeepalive < 20000) {
@@ -5859,9 +6137,10 @@ function registerStorageContextListener() {
     if (!newId || !wsChannel || wsChannel.readyState !== WebSocketImpl.OPEN)
       return;
     const channel = wsChannel;
-    if (!sendWsRegistration(channel, newId)) {
-      closeWsForReconnect(channel);
-    }
+    sendWsRegistration(channel, newId).then((ok) => {
+      if (!ok)
+        closeWsForReconnect(channel);
+    });
   });
 }
 

@@ -18,16 +18,19 @@ import {
   updateSessionMeta,
 } from "../shared/monitor-artifacts"
 import { chooseOutboundTransport, isRelayPing, relaySlotAfterClose, validateContextRouting } from "./outbound-routing"
-import { claimContextId, describeContexts, type ContextSocket } from "./context-registration"
+import { claimContextId, describeContexts, recordExtensionIdentity, type ContextSocket } from "./context-registration"
+import { extensionIdFromOrigin, installTypeLabel } from "../shared/extension-identity"
+import { bridgePidPath, bridgeSocketPath } from "../shared/bridge-paths"
 import { failPendingBridgeRequests, formatBridgeUnavailableError, getBridgeRecoveryActions, getBridgeRecoveryLayout } from "./bridge-recovery"
 import { socketWriteAll, drainSocketQueue, releaseSocketQueue } from "./socket-write"
-import { spinWatchdogStep, SPIN_EXIT_TICKS, type SpinWatchdogState } from "./spin-watchdog"
+import { captureSpinSample, spinWatchdogStep, SPIN_EXIT_TICKS, type SpinWatchdogState } from "./spin-watchdog"
 import { cleanupOwnedRuntimeFiles, clearDaemonRuntimeFiles, constantTimeTokenEquals, decideDaemonStartupRole, decideSingletonGate, defaultLifecycleDeps, generateShutdownToken, parseDaemonPidFile, readLockFile, readPidState, spawnDetachedStandaloneDaemon, writeLockFile } from "./lifecycle"
 import { DAEMON_HEALTH_SERVICE, LEGACY_HEALTH_BODY, probeDaemonHealth } from "../shared/daemon-health"
 import { assertNoInstallMaintenance } from "../shared/install-maintenance"
 import { VERSION } from "../cli/version"
 import { actionLogSummary, inboundLogSummary, outboundLogSummary } from "./redact"
 import * as secrets from "./secrets"
+import * as browserCreds from "./browser-creds"
 import { CdpManager, CDP_ACTION_TYPES } from "./cdp/manager"
 import { CDP_CONTEXT_PREFIX } from "../shared/cdp-app"
 import { IosManager } from "./ios/manager"
@@ -53,8 +56,12 @@ if (process.argv.includes("--ios-tunnel-helper")) {
 }
 
 // ── Native Bridge (interceptor-bridge) connection ────────────────────────────────
-const BRIDGE_SOCKET_PATH = "/tmp/interceptor-bridge.sock"
-const BRIDGE_PID_PATH = "/tmp/interceptor-bridge.pid"
+// Per-user runtime files (shared/bridge-paths.ts mirrors the bridge's
+// Platform.runtimeDir). The daemon and bridge install together, so the daemon
+// looks only at the current layout; user-facing detection (status, diagnose,
+// preflight) is what falls back to the legacy /tmp paths.
+const BRIDGE_SOCKET_PATH = bridgeSocketPath()
+const BRIDGE_PID_PATH = bridgePidPath()
 const BRIDGE_RECONNECT_MS = 2000
 const BRIDGE_CONNECT_TIMEOUT_MS = 5000
 const BRIDGE_RECOVERY_ACTION_TIMEOUT_MS = 1500
@@ -440,6 +447,8 @@ function dispatchToExtension(id: string, request: CliRequest, socket: Bun.Socket
 }
 
 const SECRET_DELIVERY_TYPES = new Set(["macos_type", "macos_authdialog", "input_text", "find_and_type", "os_type", "ios_type", "ios_keys", "ios_unlock", "macos_sudo"])
+// issue #248: browser saved-login fills go to browser input legs only.
+const BROWSER_LOGIN_TYPES = new Set(["input_text", "find_and_type", "os_type"])
 
 const bunVault = new secrets.BunSecretsVault()
 
@@ -602,6 +611,38 @@ async function handleSecretAction(action: Record<string, unknown>, request: CliR
   }
 }
 
+/**
+ * issue #248: read-only browser saved-login enumeration across the installed
+ * Chromium browsers (or one named browser). Exposes host + username + browser
+ * only — never the decrypted password. The model-caller refusal lives in the
+ * CLI parser (cli/commands/browser.ts), where the INTERCEPTOR_MCP marker
+ * actually lands; the daemon never receives it. The fill path
+ * (`type --browser-login`) is unaffected because it never returns the value.
+ */
+async function handleBrowserCredsAction(action: Record<string, unknown>): Promise<DaemonResult> {
+  const sub = typeof action.sub === "string" ? action.sub : "list"
+  const browserKey = typeof action.browser === "string" && action.browser ? action.browser : undefined
+  try {
+    if (sub === "status") {
+      // Which installed Chromium browsers hold a Login Data store, with their
+      // profiles. Dynamic — nothing is hardcoded as "the" browser.
+      const browsers = browserKey ? [browserCreds.browserByKey(browserKey)] : browserCreds.detectInstalledBrowsers()
+      const data = browsers.map((b) => ({ browser: b.key, label: b.label, profiles: browserCreds.listProfiles(b) }))
+      return { success: true, data: { browsers: data, count: data.length } }
+    }
+    if (sub === "list") {
+      const host = typeof action.host === "string" && action.host ? action.host : undefined
+      const rows = browserCreds.listLogins(host, browserKey)
+      const data = rows.map((r) => ({ browser: r.browser, profile: r.profile, host: r.host, username: r.username, hasPassword: r.hasPassword }))
+      return { success: true, data }
+    }
+    return { success: false, error: `unknown browser creds verb '${sub}' (list|status)` }
+  } catch (err) {
+    const e = err as browserCreds.BrowserCredsError
+    return { success: false, error: e.message, code: e.code }
+  }
+}
+
 function parseAppsList(data: unknown): Array<{ pid: number; name: string; bundleId: string }> {
   if (typeof data !== "string") return []
   const out: Array<{ pid: number; name: string; bundleId: string }> = []
@@ -677,8 +718,20 @@ async function deliverWithSecret(id: string, action: Record<string, unknown>, re
     return
   }
 
+  await deliverResolvedValue(id, action, request, socket, actionType, value, ["secret"])
+}
+
+/**
+ * Hand a resolved credential value to the delivery leg for `actionType`. The
+ * delivered action carries `sensitive:true` (redaction) and never the source
+ * field, so the value only ever appears in-process. `stripFields` names the
+ * source markers to remove from the outgoing action (e.g. "secret",
+ * "browserLogin").
+ */
+async function deliverResolvedValue(id: string, action: Record<string, unknown>, request: CliRequest, socket: Bun.Socket<undefined>, actionType: string, value: string, stripFields: string[]): Promise<void> {
+  const reply = (result: DaemonResult) => socketWriteFramed(socket, JSON.stringify({ id, result }))
   const delivered: Record<string, unknown> = { ...action, sensitive: true }
-  delete delivered.secret
+  for (const f of stripFields) delete delivered[f]
   switch (actionType) {
     case "macos_type":
     case "macos_authdialog":
@@ -715,6 +768,69 @@ async function deliverWithSecret(id: string, action: Record<string, unknown>, re
       reply(await secrets.runSudo(value, action.cmd as string[], { keep: action.keep === true }))
       return
   }
+}
+
+/**
+ * issue #248: resolve a Chrome saved login and hand it to a browser delivery
+ * leg. The credential can only be filled into the page it belongs to: the
+ * requested host must match the live page host, and the resolved credential's
+ * own origin host must match too. This is the whole allowlist — an agent on
+ * one site can never pull another site's saved password.
+ */
+async function deliverWithBrowserLogin(id: string, action: Record<string, unknown>, request: CliRequest, socket: Bun.Socket<undefined>, actionType: string): Promise<void> {
+  const reply = (result: DaemonResult) => socketWriteFramed(socket, JSON.stringify({ id, result }))
+  if (!BROWSER_LOGIN_TYPES.has(actionType)) { reply({ success: false, error: `--browser-login is not supported for '${actionType}'` }); return }
+  const spec = action.browserLogin as { host?: unknown; field?: unknown; browser?: unknown } | undefined
+  const host = spec && typeof spec.host === "string" ? spec.host : ""
+  const field: browserCreds.BrowserLoginField = spec && spec.field === "user" ? "user" : "pass"
+  const browserKey = spec && typeof spec.browser === "string" && spec.browser ? spec.browser : undefined
+  if (!host) { reply({ success: false, error: "--browser-login requires a host" }); return }
+
+  // Bind the fill to the live page. The delivery target derivation already
+  // resolves the tab's host for the browser surface.
+  let pageHost = ""
+  try {
+    const target = await targetForAction(action, actionType, request)
+    if (target.kind !== "browser") { reply({ success: false, error: "--browser-login only fills browser fields" }); return }
+    pageHost = (target.id ?? "").toLowerCase()
+  } catch (err) { reply({ success: false, error: (err as Error).message }); return }
+
+  if (!browserCreds.hostMatches(pageHost, host)) {
+    emitEvent("browser_login", { requestId: id, host, pageHost, field, browser: browserKey, action: actionType, outcome: "denied", code: "host_mismatch" })
+    reply({ success: false, error: `--browser-login host '${host}' does not match the current page host '${pageHost}'`, code: "host_mismatch" })
+    return
+  }
+
+  let value: string
+  let resolvedOrigin: string
+  let resolvedBrowser: string
+  try {
+    const res = browserCreds.resolveLogin(host, field, browserKey)
+    value = res.value
+    resolvedOrigin = res.originUrl
+    resolvedBrowser = res.browser
+  } catch (err) {
+    const e = err as browserCreds.BrowserCredsError
+    emitEvent("browser_login", { requestId: id, host, field, browser: browserKey, action: actionType, outcome: "denied", code: e.code ?? "error" })
+    reply({ success: false, error: e.message, code: e.code })
+    return
+  }
+
+  // Defense in depth: the credential's own origin must also match the page.
+  let originHost = ""
+  try { originHost = new URL(resolvedOrigin).hostname.toLowerCase() } catch {}
+  if (originHost && !browserCreds.hostMatches(pageHost, originHost) && !browserCreds.hostMatches(originHost, pageHost)) {
+    emitEvent("browser_login", { requestId: id, host, pageHost, field, browser: resolvedBrowser, action: actionType, outcome: "denied", code: "origin_mismatch" })
+    reply({ success: false, error: `resolved credential origin '${originHost}' does not match the page host '${pageHost}'`, code: "origin_mismatch" })
+    return
+  }
+  if (field === "pass" && value.length === 0) {
+    reply({ success: false, error: `saved login for '${host}' has an empty password`, code: "not_found" })
+    return
+  }
+
+  emitEvent("browser_login", { requestId: id, host, pageHost, field, browser: resolvedBrowser, action: actionType, outcome: "released" })
+  await deliverResolvedValue(id, action, request, socket, actionType, value, ["browserLogin"])
 }
 
 // Start bridge connection on daemon startup
@@ -881,6 +997,13 @@ function persistNetArtifactFromEvent(ev: Record<string, unknown>): void {
 const STANDALONE = process.argv.includes("--standalone")
 const NATIVE_STANDALONE_BOOT_TIMEOUT_MS = 5_000
 
+// Chrome passes the caller's origin (chrome-extension://<id>/) as the native
+// host's first argument, so a daemon or relay spawned by native messaging knows
+// which extension copy opened the port.
+function nativeCallerOrigin(): string | undefined {
+  return process.argv.find((arg) => arg.startsWith("chrome-extension://"))
+}
+
 log(`daemon starting (mode: ${STANDALONE ? "standalone" : "native-messaging"})`)
 
 try {
@@ -904,7 +1027,7 @@ async function startNativeRelay(existingPid: number | null): Promise<never> {
     const relaySocketHandlers: Bun.SocketHandler<undefined> = {
       open(socket: Bun.Socket<undefined>) {
         // Register as native relay — singleton routes traffic to handleNativeMessage
-        const reg = JSON.stringify({ type: "native-relay" })
+        const reg = JSON.stringify({ type: "native-relay", origin: nativeCallerOrigin() })
         const encoded = Buffer.from(reg, "utf-8")
         const header = Buffer.alloc(4)
         header.writeUInt32LE(encoded.byteLength, 0)
@@ -1148,6 +1271,10 @@ function handleNativeMessage(msg: { id?: string; type?: string; [key: string]: u
   if (msg.type === "event") {
     const eventName = msg.event as string || "extension_event"
     const eventPayload = { ...msg } as Record<string, unknown>
+    if (eventName === "connection_established") {
+      const id = typeof eventPayload.extensionId === "string" ? eventPayload.extensionId : "unknown id"
+      log(`native extension connected: ${installTypeLabel(eventPayload.installType as string | undefined)} ${eventPayload.version ?? ""} (${id})`)
+    }
     if (typeof eventPayload.sid === "string") {
       try { persistNetArtifactFromEvent({ event: eventName, ...eventPayload }) } catch {}
       delete eventPayload.bp
@@ -1222,6 +1349,14 @@ const extensionWsMap = new Map<string, ContextSocket>()
 // only adds the descriptive metadata those paths don't carry.
 const nativeAgentMeta = new Map<string, NativeAgentState>()
 let nativeRelaySocket: Bun.Socket<undefined> | null = null
+// Origin the current relay was spawned for; the daemon's own argv when Chrome
+// spawned this process directly. Drives the per-context `native` flag.
+let nativeRelayOrigin: string | undefined
+function nativeExtensionId(): string | undefined {
+  if (nativeRelaySocket && nativeRelayOrigin) return extensionIdFromOrigin(nativeRelayOrigin)
+  if (!STANDALONE && stdinAlive) return extensionIdFromOrigin(nativeCallerOrigin())
+  return undefined
+}
 const wsOutboundQueues = new Map<string, string[]>()
 const WS_QUEUE_CAP = 50
 
@@ -1751,7 +1886,9 @@ const socketHandlers: Bun.SocketHandler<undefined> = {
               log("native relay superseded — previous registration replaced (reconnect or second browser)")
             }
             nativeRelaySocket = socket
-            log("native relay registered via IPC socket")
+            const origin = (request as { origin?: unknown }).origin
+            nativeRelayOrigin = typeof origin === "string" ? origin : undefined
+            log(`native relay registered via IPC socket${nativeRelayOrigin ? ` (origin ${nativeRelayOrigin})` : ""}`)
             continue
           }
 
@@ -1805,7 +1942,7 @@ const socketHandlers: Bun.SocketHandler<undefined> = {
           if (action?.type === "contexts") {
             const ids = [...extensionWsMap.keys(), ...cdpManager.contextIds(), ...iosManager.contextIds()]
             const list = action.verbose === true
-              ? describeContexts(ids, (c) => extensionWsMap.get(c), { runtime: NATIVE_CONTEXT_PREFIX, cdp: CDP_CONTEXT_PREFIX, ios: IOS_CONTEXT_PREFIX })
+              ? describeContexts(ids, (c) => extensionWsMap.get(c), { runtime: NATIVE_CONTEXT_PREFIX, cdp: CDP_CONTEXT_PREFIX, ios: IOS_CONTEXT_PREFIX }, nativeExtensionId())
               : ids
             socketWriteFramed(socket, JSON.stringify({ id, result: { success: true, data: list } }))
             continue
@@ -1827,6 +1964,18 @@ const socketHandlers: Bun.SocketHandler<undefined> = {
           if (action && (action.type === "macos_sudo" || typeof action.secret === "string")) {
             deliverWithSecret(id, action, request, socket, actionType).catch((err) => {
               socketWriteFramed(socket, JSON.stringify({ id, result: { success: false, error: `secret delivery failed: ${(err as Error).message}` } }))
+            })
+            continue
+          }
+          // issue #248: read-only browser credential enumeration, and the
+          // `type --browser-login` fill that resolves a saved password here.
+          if (action?.type === "browser_creds") {
+            handleBrowserCredsAction(action).then((result) => socketWriteFramed(socket, JSON.stringify({ id, result })))
+            continue
+          }
+          if (action && action.browserLogin && typeof action.browserLogin === "object") {
+            deliverWithBrowserLogin(id, action, request, socket, actionType).catch((err) => {
+              socketWriteFramed(socket, JSON.stringify({ id, result: { success: false, error: `browser-login delivery failed: ${(err as Error).message}` } }))
             })
             continue
           }
@@ -1915,6 +2064,7 @@ const socketHandlers: Bun.SocketHandler<undefined> = {
           const { slot, released } = relaySlotAfterClose(nativeRelaySocket, socket)
           nativeRelaySocket = slot
           if (released) {
+            nativeRelayOrigin = undefined
             log("native relay disconnected")
           } else {
             log("stale native relay closed — current relay registration kept")
@@ -2058,9 +2208,16 @@ function startWsServer(): ReturnType<typeof Bun.serve> {
           if (claim.status === "conflict") {
             return
           }
-          const extVersion = (request as { version?: unknown }).version
-          ;(ws as ContextSocket).__version = typeof extVersion === "string" ? extVersion : undefined
-          log(`ws extension registered [context: ${ctxId}]${typeof extVersion === "string" ? ` extension ${extVersion}` : ""}`)
+          // 0.24.x extensions send version only and older ones nothing; every
+          // identity field is optional so they register exactly as before.
+          const sock = ws as ContextSocket
+          recordExtensionIdentity(sock, request as { version?: unknown; extensionId?: unknown; installType?: unknown })
+          const detail = [
+            sock.__version ? `extension ${sock.__version}` : "",
+            sock.__installType ? installTypeLabel(sock.__installType) : "",
+            sock.__extensionId ? `id ${sock.__extensionId}` : "",
+          ].filter(Boolean).join(", ")
+          log(`ws extension registered [context: ${ctxId}]${detail ? ` ${detail}` : ""}`)
           drainWsOutboundQueue(ctxId)
           return
         }
@@ -2322,6 +2479,7 @@ function daemonIsIdle(): boolean {
 let spinState: SpinWatchdogState = { busyIdleTicks: 0 }
 let spinCpu = process.cpuUsage()
 let spinWall = Date.now()
+let spinSampleAttempted = false
 function spinWatchdogTick(): void {
   if (process.env.INTERCEPTOR_SPIN_WATCHDOG === "off") return
   const now = Date.now()
@@ -2336,6 +2494,13 @@ function spinWatchdogTick(): void {
   const rssMb = Math.round(process.memoryUsage().rss / 1048576)
   log(`spin watchdog: ${pct}% CPU over the last ${Math.round(wallMs / 1000)}s with no clients or in-flight requests (tick ${step.state.busyIdleTicks}/${SPIN_EXIT_TICKS}, rss ${rssMb} MiB) — issue #216`)
   emitEvent("daemon_spin_detected", { busyFraction: step.busyFraction, ticks: step.state.busyIdleTicks, rssMb })
+  if (!spinSampleAttempted) {
+    spinSampleAttempted = true
+    void captureSpinSample().then(result => {
+      log(`spin watchdog sample: ${JSON.stringify(result)}`)
+      emitEvent("daemon_spin_sample", result)
+    })
+  }
   if (step.verdict !== "exit") return
   log("spin watchdog: exiting so the next CLI call respawns a fresh daemon (INTERCEPTOR_SPIN_WATCHDOG=off disables this)")
   emitEvent("daemon_spin_exit", { busyFraction: step.busyFraction, ticks: step.state.busyIdleTicks, rssMb })

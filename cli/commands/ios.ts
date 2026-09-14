@@ -10,10 +10,10 @@
  */
 
 import { sendCommand, type DaemonResponse, type DaemonResult } from "../transport"
+import { helpForCommand } from "../help"
 import { runIosWebCommand } from "./ios-web"
 import { runIosSvcCommand } from "./ios-svc"
 import { runIosDevCommand } from "./ios-dev"
-import { readSecretValue } from "../prompt"
 
 /** Device-service introspection subcommands, delegated to ios-svc.ts. */
 const IOS_SVC_SUBCOMMANDS = new Set(["diag", "logs", "fs", "crash", "profiles", "notify", "springboard"])
@@ -98,12 +98,12 @@ Get started (requires Xcode signed in with your Apple ID) —   setup [<device>]
                               • trust the certificate (Settings > General > VPN & Device Management)
   refresh [<device>]        force a re-sign now (also runs on a timer before expiry)
 
-Experimental no-Xcode Apple-services path:
-  login --apple-id <id> [--code <2fa>] [--stdin]   sign in; the password is read at a hidden prompt (or stdin). Token → Keychain. One time.
-  logout                    drop the stored Apple-ID token
+Unsupported compatibility command:
+  login                     fails before password input; use ios setup
+  logout                    remove legacy stored Apple-ID data
 
-Operator path (prebuilt, needs Xcode/devicectl):
-  install [<device>]        push the prebuilt agent to your iPhone (plugged in + unlocked)
+Signed-runner path:
+  install [<device>]        reinstall a runner previously signed by ios setup
   devices                   list iPhones that have the agent
   name <device> <alias>     give a phone a friendly name (e.g. "work")
 
@@ -114,9 +114,9 @@ const FULL_HELP = `interceptor ios — automate your iPhone
 Setup:
   setup [<device>] [--team <id>]             Xcode self-service build/sign + install + launch
   refresh [<device>] [--team <id>]           re-sign now (also automatic before expiry)
-  login --apple-id <id> [--stdin]            experimental no-Xcode Apple-services path (password at a hidden prompt)
-  logout                                     drop the stored Apple-ID token
-  install [<device>]                         push/refresh the prebuilt agent (operator path)
+  login                                      unavailable; fails before password input and points to setup
+  logout                                     remove legacy stored Apple-ID data
+  install [<device>]                         reinstall a runner previously signed by setup
   devices                                    phones with the agent (+ names)
   name <device> <alias>                      rename a phone (use it with --on <alias>)
 
@@ -138,10 +138,10 @@ Drive a phone (add --on <name>, or it uses your only phone):
 
 Connection model (how the runner reaches the phone):
   • The phone runs an on-device XCUITest runner (InterceptorRunner) that DIALS IN
-    to the daemon over WiFi. There is no persistent socket held open while idle.
-  • 'devices' shows "connected: false" whenever the runner isn't actively dialed in.
-    That is the NORMAL idle state for a correctly-installed phone — it means
-    "installed, will auto-connect on the next verb", NOT "broken" or "offline".
+    to the daemon over WiFi.
+  • 'devices' shows "connected: false" when the runner isn't dialed in. That is
+    "installed, will auto-connect on the next drive verb", NOT "broken" or "offline".
+    ('ios unlock' is the exception: it needs the runner already connected.)
   • You do NOT need to connect manually. Just run a verb — e.g.
     'interceptor ios tree --on <name>' — and the daemon launches the runner and
     the phone dials in. 'connected' flips to true for the life of that session.
@@ -150,9 +150,13 @@ Connection model (how the runner reaches the phone):
     cannot start on a locked phone: unlock once by hand, then drive as usual.
   • Keep the phone UNLOCKED and AWAKE while driving. Auto-lock / sleep tears the
     runner down (you'll see connected:false again and the next verb re-launches).
-  • If a verb hangs or times out: confirm the phone is unlocked, on the same
-    network, and reachable — 'interceptor ios status' shows the live context and
-    'xcrun devicectl list devices' shows whether macOS sees it as "available".
+  • If a verb hangs or times out: confirm the phone is unlocked and reachable —
+    'interceptor ios status' shows the live context plus the dial-back address the
+    runner is handed (dialBack / dialBackVia); 'xcrun devicectl list devices'
+    shows whether macOS sees it as "available". iOS silently blocks a backgrounded
+    runner's LAN connection until Settings › Privacy & Security › Local Network
+    grants InterceptorRunner-Runner, so the daemon prefers a VPN address (Tailscale)
+    when the Mac has one — put the phone on the same VPN, or grant that switch once.
 
 Troubleshooting — when things aren't working, try these IN ORDER:
   1. "device not found" / "not visible to usbmuxd" — the phone dropped off the
@@ -168,18 +172,22 @@ Troubleshooting — when things aren't working, try these IN ORDER:
   2b. Runner verbs time out with 'timeout requesting channel …XCTestManager_IDEInterface'
      but Instruments (proc/top/shot) works — the FIRST XCUITest launch after a
      reboot pops an on-device dialog: "Enter iPhone Passcode for XCTest — Enable
-     UI Automation". iOS gates the runner until you enter your passcode on it.
-     Approve it, then restart the daemon (so it drops the stale testmanagerd
-     session) and retry a verb.
+     UI Automation". iOS gates the runner until the passcode is entered ON THE
+     PHONE. This sheet has no software input path: the runner is the process it
+     blocks, 'ios unlock'/'keys --secret' need that runner, AccessibilityAudit and
+     Accessibility Inspector can read it but every action on it is unsupported,
+     Switch Control cannot target a digit, and iPhone Mirroring does not forward
+     keystrokes to it. Agents: STOP and ask for a tap on the phone (or a paired
+     hardware keyboard). Then restart the daemon (so it drops the stale
+     testmanagerd session) and retry a verb.
   3. Verbs time out / Instruments (proc, top, shot) return nothing — the Developer
      Disk Image unmounts every boot. Re-mount it:
        'xcrun devicectl device info details --device <udid>'   (brings back
        testmanagerd/Instruments), then retry.
-  4. Runner drops mid-sequence ('ios runner disconnected') — the runner dials in
-     per session and iOS suspends its socket when it backgrounds to drive another
-     app. Keep the phone UNLOCKED with Auto-Lock = Never (Settings › Display &
-     Brightness › Auto-Lock), and run multi-step flows as a tight burst (don't let
-     it idle between verbs). The next verb re-launches it automatically.
+  4. Runner drops mid-sequence ('ios runner disconnected') — iOS can suspend the
+     runner's socket when it backgrounds to drive another app. Keep the phone
+     UNLOCKED with Auto-Lock = Never (Settings › Display & Brightness › Auto-Lock).
+     The next verb re-launches it automatically.
   5. Still stuck — capture detail with 'DEBUG_IOS=1 DBG=1' in the daemon env, and
      check 'interceptor ios status' (tunnel/connection) + 'interceptor ios devices'.
 
@@ -204,6 +212,15 @@ export async function runIosCommand(
     const dev = await send({ type: "ios_devices" })
     const list = (dev.success && dev.data && typeof dev.data === "object") ? (dev.data as { devices?: unknown[] }).devices : undefined
     console.log(Array.isArray(list) && list.length > 0 ? FULL_HELP : SETUP_HELP)
+    return
+  }
+
+  // `interceptor ios <sub> --help` / `-h`: the top-level CLI routes every
+  // `ios … --help` here expecting help, so answer it BEFORE any lane is
+  // delegated or any daemon request is sent. Without this, `ios setup --help`
+  // performed a full build/sign/install. `web` keeps its own help page.
+  if (sub !== "web" && args.slice(2).some((a) => a === "--help" || a === "-h")) {
+    console.log(helpForCommand("ios", sub) ?? FULL_HELP)
     return
   }
 
@@ -237,23 +254,10 @@ export async function runIosCommand(
       return
     }
 
-    // ── self-service install (Apple-ID re-sign, no Xcode) ──────────────
+    // Retained for older clients, but fail before touching terminal or stdin.
     case "login": {
-      // issue #244: the Apple ID password comes from a hidden prompt or stdin,
-      // never argv (shell history, ps).
-      const appleId = flagValue(args, "--apple-id") ?? flagValue(args, "--id")
-      if (hasFlag(args, "--password") || hasFlag(args, "--pw")) {
-        console.error("error: never pass the password on argv. Run 'interceptor ios login --apple-id <id>' and type it at the hidden prompt, or pipe it: printf '%s' \"$PW\" | interceptor ios login --apple-id <id> --stdin")
-        process.exit(1)
-      }
-      const code = flagValue(args, "--code")
-      if (!appleId) {
-        console.error("usage: interceptor ios login --apple-id <id> [--code <2fa>] [--stdin]")
-        process.exit(1)
-      }
-      const password = await readSecretValue(`Apple ID password for ${appleId}`, { stdin: hasFlag(args, "--stdin"), confirm: false })
-      emitExit(await send({ type: "ios_login", appleId, password, code }), jsonMode)
-      return
+      console.error("error: ios login is unavailable because no-Xcode Apple-ID signing is not implemented. Use: interceptor ios setup [device]")
+      process.exit(1)
     }
 
     case "setup":

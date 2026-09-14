@@ -10,7 +10,7 @@ const COMMAND_HELP: Record<string, string> = {
     "interceptor update — update Interceptor itself",
     "",
     "  interceptor update             macOS: check now — reports Sparkle's selected version or no-update reason",
-    "  interceptor update status      macOS: check result, selected version, lifecycle phase, feed, and schedule",
+    "  interceptor update status      macOS: consistent lifecycle state, live-session age, recovery hint, feed, and schedule",
     "",
     "Notes:",
     "  - macOS: requires the full install (the updater lives in the bridge app); browser-only",
@@ -57,7 +57,7 @@ const COMMAND_HELP: Record<string, string> = {
 // extracted from the HELP string below by matching lines that begin with
 // "  interceptor <cmd> ". User types `interceptor <cmd> --help` (or `-h`) and
 // gets exactly the slice for that command.
-export function helpForCommand(cmd: string): string | null {
+export function helpForCommand(cmd: string, sub?: string): string | null {
   const footer = `Run 'interceptor help --all' for the full command list, or 'interceptor ${cmd} -h' is an alias for --help.`
   // per-verb returns semantics from the manifest spec, so an
   // agent forming an invocation also learns exactly what comes back.
@@ -68,26 +68,52 @@ export function helpForCommand(cmd: string): string | null {
     if (spec.example) semantics.push(`Example: ${spec.example}`)
   }
   const curated = COMMAND_HELP[cmd]
-  if (curated) {
+  if (curated && !sub) {
     return [curated, ...semantics, "", footer].join("\n")
   }
+  // A curated page that documents the sub-verb answers for it too
+  // (`help update status`).
+  if (curated && sub && curated.includes(`interceptor ${cmd} ${sub}`)) {
+    return [curated, ...semantics, "", footer].join("\n")
+  }
+  // `help macos tree` / `help ios click`: only that sub-verb's lines. The
+  // unknown-flag error tells agents to run `help <cmd>`; a page that answers
+  // "no help" for a listed verb sent them guessing (106+ results, 2026-09-10).
   const lines = HELP.split("\n")
   const matched: string[] = []
   for (const line of lines) {
-    const m = line.match(/^\s+interceptor\s+(\S+)\b/)
-    if (m && m[1] === cmd) {
+    const m = line.match(/^\s+interceptor\s+(\S+)(?:\s+(\S+))?/)
+    // Grouped sub-verbs (`interceptor ios tree|find|inspect …`) match any of
+    // their alternatives, so `help ios tree` finds the line.
+    if (m && m[1] === cmd && (!sub || (m[2] ?? "").split("|").includes(sub))) {
       matched.push(line)
     }
   }
-  if (!matched.length) return null
-  return [
-    `interceptor ${cmd} — usage`,
-    "",
-    ...matched,
-    ...semantics,
-    "",
-    footer,
-  ].join("\n")
+  if (matched.length) {
+    return [
+      `interceptor ${cmd}${sub ? ` ${sub}` : ""} — usage`,
+      "",
+      ...matched,
+      ...semantics,
+      "",
+      footer,
+    ].join("\n")
+  }
+  // Manifest fallback: verbs the HELP text never listed line-by-line but the
+  // machine-readable manifest describes (usage, flags, what comes back).
+  if (spec && !sub) {
+    const flags = (spec.flags ?? []).map(f => `  ${f.name}${f.value ? ` <${f.value}>` : ""}  ${f.description}`)
+    return [
+      `interceptor ${cmd} — ${spec.summary}`,
+      "",
+      `  ${spec.usage}`,
+      ...(flags.length ? ["", "Flags:", ...flags] : []),
+      ...semantics,
+      "",
+      footer,
+    ].join("\n")
+  }
+  return null
 }
 
 // ── progressive disclosure ─────────────────────────────────────
@@ -115,12 +141,12 @@ const MAP_BROWSER = `BROWSER — a signed-in Chrome/Brave profile, background ta
   Read text  text (visible innerText) · text --markdown (keeps headings/tables) · html <ref> (raw markup)
   Structure  tree (a11y refs) · find "<q>" (current-page text + elements) · state · diff
   Web        websearch "<q>" (configured default provider → managed background tab + page read)
-  Extract    table · links · images · forms · query <css> · exists · count · attr · style      structured JSON
+  Extract    table · links · images · forms · query <css> · exists · count · attr · style      structured JSON; query returns at most 20 plus count/returned/truncated
   Act        act <ref> · click · type · select · focus · hover · drag · dblclick · rightclick · check · keys · scroll
   Navigate   navigate <url> · back · forward · scroll · wait <ms> · wait-stable
   Tabs       tabs · tab new|close|switch · window · frames · session · group (per-agent isolation) · contexts
   Network    net (passive log → HAR/pcapng) · headers · override (rewrite requests) · sse
-  Capture    screenshot [ref] · canvas · ocr · save --out <path> <expr>  (page bytes straight to disk) · eval <js> (CSP-proof)
+  Capture    screenshot [--element <ref>] · canvas · ocr · save --out <path> <expr>  (page bytes straight to disk) · eval <js> [--main]
   Data       cookies · storage · history · bookmarks · downloads · clipboard · clear
   Record     monitor (record → replay) · scene (canvas / rich editors) · batch (many actions, one call) · brand`
 
@@ -144,8 +170,9 @@ const MAP_IOS = `iOS — automate a physical iPhone over WiFi (on-device XCUITes
   Setup      ios install | login | setup     one-time: put the InterceptorRunner on the phone
   Connection model (read this before you panic about 'connected: false'):
     • Phone must be owned, unlocked, in Developer Mode, and WiFi-paired to this Mac.
-    • 'ios devices' showing "connected: false" is NORMAL when idle — it means "installed,
-      auto-connects on the next verb", NOT "broken". Just run a verb (e.g. 'ios tree --on <name>').
+    • 'ios devices' showing "connected: false" means the runner is not dialed in right now
+      — run a drive verb (e.g. 'ios tree --on <name>') and it auto-connects; 'ios unlock' needs it
+      already connected. Not "broken".
     • Keep the phone unlocked and awake while driving — auto-lock drops the runner.
     • 'interceptor help ios' / 'ios help' has the full setup + troubleshooting flow.`
 
@@ -160,6 +187,8 @@ GLOBAL FLAGS (any command, any position — flag order never changes meaning):
   --json  --context <id>  --tab <id>  --group <label>  --frame <id>  --all-surfaces
   e.g. 'open --text-only <url>' ≡ 'open <url> --text-only'
   unknown flags are rejected (exit 1) on browser commands; INTERCEPTOR_LAX_FLAGS=1 downgrades to a warning
+  env defaults, set once per lane: INTERCEPTOR_CONTEXT=<id> (browser profile when several are connected),
+  INTERCEPTOR_GROUP=<label> (tab group), INTERCEPTOR_TREE_MAX_CHARS / INTERCEPTOR_TEXT_MAX_CHARS (open/read output budget)
 
 Docs & issues: https://github.com/Hacker-Valley-Media/Interceptor`
 
@@ -181,7 +210,7 @@ const HELP_BROWSER = `interceptor — browser control CLI
 Flags:
   -V, --version                       Print version, build SHA, and build date
   --json                              Output as JSON
-  --context <id>                      Target a specific browser context (see: interceptor contexts)
+  --context <id>                      Target a specific browser context (see: interceptor contexts; env: INTERCEPTOR_CONTEXT)
   --group <label>                     Hard-scope this command to a named tab group (env: INTERCEPTOR_GROUP).
                                       Agent shells default to a soft per-session group, labeled s-<hash16>,
                                       using INTERCEPTOR_SESSION_ID or a verified Maestro, Claude Code, or Codex id.
@@ -196,6 +225,7 @@ Compound (agent-optimized):
   interceptor open <url> --tree-only         Skip text, return only tree
   interceptor open <url> --text-only         Skip tree, return only text
   interceptor open <url> --full              Full text (200K cap) instead of the 8000-char summary
+  interceptor open <url> --tree-format compact   Compact tree; INTERCEPTOR_TREE_MAX_CHARS / INTERCEPTOR_TEXT_MAX_CHARS cap open/read output
   interceptor open <url> --timeout <ms>      Override wait-stable timeout (default 5000)
   interceptor open <url> --no-wait           Return immediately after tab creation
   interceptor open <url> --reuse             Navigate the most recent managed tab instead of opening a new one (cleans up long automation runs)
@@ -228,6 +258,7 @@ Research (deep-research mode — local, no daemon, no browser):
   interceptor research --full                Print the extended playbook + verb cookbook
   interceptor research init <slug>           Scaffold a source ledger (links.json, insights.md, sources/)
   interceptor research init <slug> --effort quick|standard|exhaustive   Set the breadth floor (8 / 20 / 40)
+  interceptor research use <slug>            Make <slug> the current ledger (init does this; add/note/status use it when several exist)
   interceptor research add <url> --note "..."  Append a lead to the ledger
   interceptor research note "<insight>"      Append a running insight
   interceptor research status [<slug>]       Rubric readout: sources vs floor, domains, saturation, verdict
@@ -252,6 +283,42 @@ State:
   interceptor text <ref> --markdown          Element text rendered as markdown
   interceptor html <index|ref>               HTML of specific element
 
+Page meta and data (one call each):
+  interceptor info                           Page URL, title, viewport, readyState
+  interceptor page_info                      Same as info
+  interceptor meta                           <meta> tags of the current page
+  interceptor capabilities                   What this extension can do here: userScripts (eval --main), debugger, OS input layer
+  interceptor modals                         Open dialogs / modals on the page
+  interceptor panels                         Side panels / drawers on the page
+  interceptor regions                        Landmark regions (header, nav, main, aside, footer) with refs
+  interceptor frames                         List frames in the active tab (ids for --frame <id>)
+  interceptor what-at <x,y>                  Element under viewport coordinates (ref, role, name, rect)
+  interceptor check <ref> [true|false]       Set a checkbox / toggle (omit the value to toggle)
+  interceptor blur                           Remove focus from the active element
+  interceptor wait_for <css> [timeout-ms]    Wait until a selector matches (default 10000 ms)
+  interceptor reload                         Reload the extension (an unpacked copy picks up installed files; a store copy asks the store for an update)
+  interceptor notify <title> <message...>    Post a browser notification
+  interceptor events [--tail] [--since <ms>] Daemon event log (request timings, timeouts)
+  interceptor sessions [max]                 Recently closed tabs / windows (chrome.sessions)
+  interceptor sessions restore <id>          Restore a closed session entry
+  interceptor session start|end              Mark a CLI session (advisory; enables batch hints)
+  interceptor history "<query>" [max]        Search browser history
+  interceptor history delete <url>           Remove a history entry
+  interceptor bookmarks "<query>"            Search bookmarks
+  interceptor bookmarks add <title> <url>    Create a bookmark
+  interceptor bookmarks delete <id>          Delete a bookmark
+  interceptor bookmarks tree                 Full bookmark tree
+  interceptor downloads ["<query>"]          List downloads
+  interceptor downloads start <url> [name]   Start a download
+  interceptor downloads cancel <id>          Cancel a download
+  interceptor clipboard                      Read the clipboard
+  interceptor clipboard write <text...>      Write the clipboard
+  interceptor clear <type...> [--since <ms>] Clear browsing data (cache, cookies, history, localStorage, ...)
+  interceptor raw '<json action>'            Send one raw action object to the extension (debugging)
+  interceptor extensions list|sync           Interceptor extension packs (the capability fabric), not browser extensions
+  interceptor mcp install|status|uninstall   Register / inspect / remove Interceptor as an MCP server in installed AI runtimes
+  interceptor mcp serve                      Run the MCP server on stdio (what the runtimes launch)
+
 Actions:
   interceptor click <index|ref>              Click element (e.g. interceptor click e5)
   interceptor click --selector "<css>" [--nth N]  Click by CSS selector (0-based --nth matches query output; quote selectors with spaces)
@@ -262,6 +329,9 @@ Actions:
   interceptor type <index|ref> <text> --append  Type without clearing
   interceptor type "role:name" <text>        Type using semantic selector (e.g. "button:Submit")
   interceptor type <index|ref> --secret <name>   Type a vault secret by name (value resolved in the daemon, never shown)
+  interceptor type <index|ref> --browser-login <host> [--user] [--browser <key>]   Fill a saved login from any installed Chromium browser (password, or username with --user)
+  interceptor browser creds list [--host <host>] [--browser <key>]   List saved logins across installed Chromium browsers (host + username + browser; no passwords)
+  interceptor browser creds status               List installed Chromium browsers and the profiles that hold a Login Data store
   interceptor click "text:<query>"            Click first element whose textContent matches (e.g. "text:Save")
   interceptor select <index|ref> <value>     Select dropdown option
   interceptor focus <index|ref>              Focus element
@@ -303,7 +373,7 @@ Capture:
   interceptor screenshot --region X,Y,W,H   Capture page region (rendered + cropped)
   interceptor screenshot --scale 2           Override pixel ratio (e.g. retina from 1x display)
   interceptor screenshot --pixel             Pixel-true compositor capture (legacy captureVisibleTab — requires Chrome focused)
-  interceptor screenshot --save              Save to disk; result has filePath, no dataUrl
+  interceptor screenshot --save              Save one auto-named file in cwd; takes no path value
   interceptor screenshot --format png        Output format: png (default), jpeg, or webp
   interceptor screenshot --quality 80        Encode quality 0-100 (defaults: png 92, jpeg 92, webp 85)
   interceptor screenshot --target-max-long-edge 1568   Clamp output long edge in pixels (auto-resize at capture)
@@ -313,6 +383,8 @@ Capture:
   interceptor ocr --element N                OCR an element by ref
   interceptor eval <code>                    Run JS in isolated world
   interceptor eval <code> --main             Run JS in page context
+    --frame <id>                             Target exactly that frame; missing frames fail
+    Isolated eval may require Allow User Scripts. MAIN CSP recovery discloses a tab reload, which can discard unsaved page state.
   interceptor save --out <path> <expr>       Stream page bytes (Blob/ArrayBuffer/blob: URL) to disk; no downloads/CDP — see 'save --help'
 
 Cookies:
@@ -423,6 +495,14 @@ Recording (Session Monitor):
   interceptor monitor resume                    Resume an active paused session
   interceptor monitor status [--all]            Show status of current/all monitor sessions
   interceptor monitor status --task <taskId>    Show task envelope status
+  interceptor monitor task create "<objective>" Create a durable agent task (no recording needed)
+  interceptor monitor task checkpoint <taskId> --file <json> Save revisioned constraints, target and checks
+  interceptor monitor task resume <taskId>       Read compact task state and scoped lessons
+  interceptor monitor task verify <taskId>       Record current predicate results; preserve lifecycle status
+  interceptor monitor task complete <taskId>     Complete an active task only after fresh checks all return true
+    Completed/stopped tasks must be checkpointed before another completion attempt.
+    A completed task may have a newer failed verification; status records completion history.
+    Checkpoint schema: interceptor-browser/workflows/task-state.md. Verification never reloads pages.
   interceptor monitor task attach <taskId> <sid> Attach an existing source session
   interceptor monitor task snapshot <taskId|name>  Snapshot source artifacts under the task root
   interceptor monitor task quality <taskId|name>   Show task capture readiness gates (synthesizes a missing transcript first)
@@ -436,7 +516,8 @@ Recording (Session Monitor):
     --with-bodies                        (P1) Merge cached response bodies
 
 Meta:
-  interceptor contexts                       List IDs of all connected browser contexts (use with --context)
+  interceptor contexts [--verbose]           List connected browser contexts (verbose: version, store/unpacked, id, transports)
+  interceptor contexts rename <name>         Name the targeted context (what the popup does); use --context <id> to pick it
   interceptor init                           First-run preflight: verify daemon, bridge, and extension are reachable
   interceptor init --verbose                 Same as 'init', plus a per-component reachability breakdown
   interceptor status                         Check daemon status (local — no connection needed)
@@ -690,8 +771,9 @@ macOS Bridge (full install only):
   interceptor macos notifications post --title "..." --body "..." [--sound default] [--badge N] [--category <id>]
   interceptor macos notifications categories list|register|clear`
 
-const HELP_IOS = `  iOS — automate your iPhone (pre-built agent, no signing/env):
-  interceptor ios install [<device>]         Push the agent to a phone (plugged in + unlocked)
+const HELP_IOS = `  iOS — automate your iPhone (Xcode-signed device runner):
+  interceptor ios setup [<device>]           Build, sign, install, and launch (Xcode account required)
+  interceptor ios install [<device>]         Reinstall a runner previously signed by setup
   interceptor ios devices                     Phones with the agent (+ names)
   interceptor ios name <device> <alias>       Rename a phone (then use --on <alias>)
   interceptor ios tree|find|inspect [--on <name>]                   On-screen elements (auto-connects)

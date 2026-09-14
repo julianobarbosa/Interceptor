@@ -103,6 +103,14 @@ export function pickTimeoutForAction(action: Action): number {
   if (action.type === "screenshot") {
     return SCREENSHOT_TIMEOUT_MS
   }
+  // The bridge runs Spotlight under its own deadline (--timeout-ms, default
+  // 10 s) and answers with partial:true; the transport must outlive that
+  // deadline so the honest partial result arrives instead of the generic
+  // "waiting on a TCC prompt" timeout (2026-09-10 review, 199 results).
+  if (action.type === "macos_fs_search") {
+    const bridgeDeadline = typeof action.timeoutMs === "number" && action.timeoutMs > 0 ? action.timeoutMs : 10_000
+    return Math.max(INTERCEPTOR_TIMEOUT_MS, bridgeDeadline + 5_000)
+  }
   return ACTION_TIMEOUT_OVERRIDES_MS[action.type] ?? INTERCEPTOR_TIMEOUT_MS
 }
 
@@ -129,7 +137,10 @@ export function timeoutMessageConnected(actionType: string, ms: number): string 
   if (actionType === "net_log") {
     return `${base} Retry with a smaller --limit, use --since <ts> to fetch incrementally, or --filter to narrow.`
   }
-  return `${base} Retry; if it persists, the tab may be busy or the response too large.`
+  // No blind "Retry": the daemon may still complete the request after the CLI
+  // gave up, so replaying a click, type, or upload can fire it twice. The
+  // outcome is unknown, not failed.
+  return `${base} The outcome is unknown, not failed: run 'interceptor read' to see whether the action landed before retrying it. If it persists, the tab may be busy or the response too large (narrow with --text-only or --tree-format compact).`
 }
 
 // Minimal one-shot `{type:"contexts"}` probe with its own short deadline. The
@@ -216,6 +227,11 @@ export type DaemonResponse = {
 let globalGroup: string | undefined
 let globalGroupColor: string | undefined
 let globalGroupSoft = false
+let globalFrame: number | undefined
+
+export class ActionValidationError extends Error {}
+
+export function setGlobalFrame(frameId?: number): void { globalFrame = frameId }
 
 export function setGlobalGroup(group?: string, groupColor?: string, soft = false): void {
   globalGroup = group
@@ -225,6 +241,12 @@ export function setGlobalGroup(group?: string, groupColor?: string, soft = false
 
 /** Exported for tests (wire-shape assertion); production callers use sendCommand. */
 export function withGroup(action: Action): Action {
+  if (globalFrame !== undefined) {
+    if (action.frameId !== undefined && action.frameId !== globalFrame) {
+      throw new ActionValidationError("element frame conflicts with --frame; use the frame from the fresh element ref")
+    }
+    action = { ...action, frameId: globalFrame }
+  }
   if (!globalGroup || action.group !== undefined) return action
   const scoped: Action = { ...action, group: globalGroup }
   // Automatic session scope is a preference, not an isolation boundary.

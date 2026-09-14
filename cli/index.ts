@@ -3,9 +3,9 @@ import { HELP, shortHelp, fullHelp, helpForCommand } from "./help"
 import { detectSurfaces, SURFACE_UPGRADE_HINT } from "./lib/surfaces"
 import { runSkillsCommand, maybeEmitSkillsHint } from "./commands/skills"
 import { runManifestCommand } from "./manifest"
-import { parseTabFlag, parseContextFlag, resolveGroupScope, parseGroupColorFlag } from "./parse"
+import { parseTabFlag, resolveContextId, resolveGroupScope, parseGroupColorFlag } from "./parse"
 import { formatState, formatTabs, formatCookies, formatFind, formatResult } from "./format"
-import { sendCommand, sendCommandWs, setGlobalGroup, type DaemonResult, type DaemonResponse, type Action } from "./transport"
+import { sendCommand, sendCommandWs, setGlobalGroup, setGlobalFrame, type DaemonResult, type DaemonResponse, type Action } from "./transport"
 import { UPLOAD_CHUNK_B64_BYTES } from "../shared/platform"
 import { chunkBase64 } from "../shared/upload"
 import { fromPassive, writeExport, type PassiveNetEntry, type ExportFormat } from "../shared/exports"
@@ -27,11 +27,12 @@ import { parseMetaCommand } from "./commands/meta"
 import { parseEvalCommand } from "./commands/eval"
 import { parseSaveCommand } from "./commands/save"
 import { parseBrandCommand } from "./commands/brand"
-import { parseGroupCommand } from "./commands/group"
+import { parseGroupCommand, listExtensionContextIds, runGroupAcrossContexts } from "./commands/group"
 import { parseBatchCommand } from "./commands/batch"
 import { parseMonitorCommand } from "./commands/monitor"
 import { parseSceneCommand } from "./commands/scene"
 import { parseSseCommand } from "./commands/sse"
+import { parseBrowserCommand } from "./commands/browser"
 import { runCompoundCommand, webSearchQuery, webSearchTimeout } from "./commands/compound"
 import { runOverride } from "./commands/override"
 import { runMacosCommand } from "./commands/macos"
@@ -39,11 +40,12 @@ import { runIosCommand } from "./commands/ios"
 import { runUpgradeCommand } from "./commands/upgrade"
 import { runInitCommand } from "./commands/init"
 import { runResearchCommand } from "./commands/research"
-import { runDiagnoseCommand } from "./commands/diagnose"
+import { runDiagnoseCommand, staleExtensionHint } from "./commands/diagnose"
+import { installTypeLabel } from "../shared/extension-identity"
 import { runExtensionsCommand } from "./commands/extensions"
 import { runDaemonCommand } from "./commands/daemon"
 import { VERSION, BUILD_SHA, BUILD_DATE } from "./version"
-import { buildFilteredArgs } from "./global-flags"
+import { buildFilteredArgs, parseFrameFlag } from "./global-flags"
 import { normalizeArgsSplit } from "./normalize"
 
 // console.log must not be used for CLI output: Bun's console.log writer
@@ -76,6 +78,7 @@ const POWER_CMDS = new Set(["keepawake", "idle"])
 const DELEGATE_CMDS = new Set(["delegate"])
 const SCENE_CMDS = new Set(["scene"])
 const SSE_CMDS = new Set(["sse"])
+const BROWSER_CMDS = new Set(["browser"])
 const COMPOUND_CMDS = new Set(["open", "read", "act", "inspect", "websearch", "search"])
 const OVERRIDE_CMDS = new Set(["override"])
 const MACOS_CMDS = new Set(["macos"])
@@ -106,7 +109,7 @@ const ALL_KNOWN_CMDS = new Set<string>([
   ...COMPOUND_CMDS, ...OVERRIDE_CMDS, ...MACOS_CMDS, ...IOS_CMDS,
   ...UPDATE_CMDS, ...UPGRADE_CMDS, ...INIT_CMDS, ...RESEARCH_CMDS, ...EXTENSIONS_CMDS,
   ...SKILLS_CMDS, ...MANIFEST_CMDS, ...DIAGNOSE_CMDS, ...MCP_CMDS, ...DAEMON_CMDS,
-  ...POWER_CMDS, ...DELEGATE_CMDS,
+  ...POWER_CMDS, ...DELEGATE_CMDS, ...BROWSER_CMDS,
   "help", "contexts",
 ])
 
@@ -140,19 +143,16 @@ async function main() {
   const useWs = !carriesSecret && (globalArgs.includes("--ws") || isSaveCmd || (isScreenshotCmd && !globalArgs.includes("--no-ws")))
   const anyTab = globalArgs.includes("--any-tab")
   const globalTabId = parseTabFlag(globalArgs)
-  const globalContextId = parseContextFlag(globalArgs)
+  const globalContextId = resolveContextId(globalArgs)
   // Explicit or automatic session scope is injected into every outgoing
   // action at the transport choke point, covering simple, compound, and loop paths.
   const groupScope = resolveGroupScope(args)
   setGlobalGroup(groupScope.label, parseGroupColorFlag(globalArgs), groupScope.soft)
 
-  // Build filtered args (strip global flags). NB: --json is dual-purpose —
-  // it can be a global "emit JSON output" boolean OR a domain-specific
-  // value flag (e.g. `translate batch --json '["a","b"]'`). Disambiguate
-  // by position: `--json` at index 0 or 1 is the global boolean (it's
-  // always near the front, like `interceptor --json status`); deeper
-  // occurrences are always domain value flags consumed by the parser.
+  // Build filtered args (strip global flags). Native surfaces retain nested
+  // command-local JSON payload flags such as `macos translate batch --json`.
   let filtered = buildFilteredArgs(args)
+  if (filtered[0] !== "macos" && filtered[0] !== "ios") setGlobalFrame(parseFrameFlag(globalArgs))
 
   // progressive disclosure. Bare invocation and `help` print the
   // concise tier-0 card; `help <cmd>` prints one command's contract; `help
@@ -160,11 +160,15 @@ async function main() {
   if (filtered.length === 0 || filtered[0] === "help") {
     const helpArg = filtered[1]
     if (helpArg && !helpArg.startsWith("-")) {
-      const sub = helpForCommand(helpArg)
+      // `help macos tree` narrows to one sub-verb; `help <verb>` alone keeps
+      // the whole verb's block.
+      const subArg = filtered[2] && !filtered[2].startsWith("-") ? filtered[2] : undefined
+      const sub = helpForCommand(helpArg, subArg)
       if (sub) {
         console.log(sub)
       } else {
-        console.error(`error: no help for '${helpArg}'. Run 'interceptor help --all' for the full reference.`)
+        const topic = subArg ? `${helpArg} ${subArg}` : helpArg
+        console.error(`error: no help for '${topic}'. Run 'interceptor help' for the command map or 'interceptor help --all' for the full reference.`)
         process.exit(1)
       }
     } else if (filtered.includes("--all")) {
@@ -191,6 +195,8 @@ async function main() {
   }
 
   const cmd = filtered[0]
+  const filteredOptionTerminator = filtered.indexOf("--")
+  const commandOptions = filtered.slice(1, filteredOptionTerminator === -1 ? filtered.length : filteredOptionTerminator)
 
   // rewrite argv to [cmd, ...positionals, ...flags] so flag
   // position never changes meaning (e.g. `open --text-only <url>` used to
@@ -203,7 +209,7 @@ async function main() {
   // Per-command --help / -h short-circuit. `interceptor open --help` prints
   // the open-specific help block; `interceptor --help` (no command) falls
   // back to the full HELP. Runs before any daemon-spawn side effect.
-  if (filtered.includes("--help") || filtered.includes("-h")) {
+  if (cmd === "--help" || cmd === "-h" || commandOptions.includes("--help") || commandOptions.includes("-h")) {
     // Bare `interceptor --help` (no command) prints the tier-0 card.
     if (cmd.startsWith("-")) {
       console.log(shortHelp(detectSurfaces(args)))
@@ -245,6 +251,13 @@ async function main() {
   if ((cmd === "websearch" || cmd === "search") && webSearchTimeout(filtered) === null) {
     console.error("error: --timeout must be a non-negative integer")
     process.exit(1)
+  }
+
+  // Retained only for older clients. Reject before surface detection or daemon
+  // startup so this unsupported path can never prompt for or transport a password.
+  if (cmd === "ios" && filtered[1] === "login") {
+    await runIosCommand(filtered, { jsonMode, contextId: globalContextId })
+    return
   }
 
   // fail fast (before any daemon spawn) when a surface is not
@@ -368,11 +381,60 @@ async function main() {
 
   if (cmd === "contexts") {
     try {
-      const response = await sendCommand({ type: "contexts" }, undefined, undefined)
+      // `contexts rename <name>`: give the targeted extension copy a context
+      // name (what the popup does). Needed once after the store-key switch,
+      // which gave unpacked copies a new ID and therefore fresh storage.
+      if (filtered[1] === "rename") {
+        const name = filtered[2]
+        if (!name || name.startsWith("--")) {
+          console.error("error: usage: interceptor contexts rename <new-name> [--context <current-id>]")
+          process.exit(1)
+        }
+        const response = await sendCommand({ type: "context_set", name }, undefined, globalContextId)
+        if (!response.result.success) {
+          console.error(`error: ${response.result.error || "context rename failed"}`)
+          // An extension older than context_set (pre-0.25.0, including the
+          // store copy until the store carries this version) answers
+          // "unknown action type"; name the copy-specific fix as the generic
+          // action path does.
+          if (typeof response.result.error === "string" && response.result.error.startsWith("unknown action type:")) {
+            process.stderr.write(`${await staleExtensionHint(VERSION, globalContextId)}\n`)
+          }
+          process.exit(1)
+        }
+        console.log(jsonMode
+          ? JSON.stringify(response.result.data)
+          : `context renamed to '${name}'; it re-registers under that name within a second (verify: interceptor contexts)`)
+        return
+      }
+      const verbose = filtered.includes("--verbose")
+      const response = await sendCommand({ type: "contexts", ...(verbose ? { verbose: true } : {}) }, undefined, undefined)
       const result = response.result
       if (!result.success) {
         console.error(`error: ${result.error || "failed to list browser contexts"}`)
         process.exit(1)
+      }
+      if (verbose) {
+        // Plain ids stay the default contract; --verbose adds kind, version,
+        // which copy (store/unpacked), the extension id, and the transports.
+        type Entry = { contextId: string; kind?: string; version?: string; extensionId?: string; installType?: string; native?: boolean }
+        const list: Entry[] = (Array.isArray(result.data) ? result.data as Array<string | Entry> : [])
+          .map(e => typeof e === "string" ? { contextId: e, kind: "extension" } : e)
+        if (jsonMode) {
+          console.log(JSON.stringify(list))
+        } else if (list.length === 0) {
+          console.log("no browser contexts connected")
+        } else {
+          for (const c of list) {
+            const parts = [c.contextId, c.kind ?? "extension"]
+            if (c.version) parts.push(c.version)
+            if (c.installType) parts.push(installTypeLabel(c.installType))
+            if (c.extensionId) parts.push(c.extensionId)
+            if ((c.kind ?? "extension") === "extension" && (c.installType || c.extensionId)) parts.push(c.native ? "ws+native" : "ws")
+            console.log(parts.join("  "))
+          }
+        }
+        return
       }
       const ids = Array.isArray(result.data) ? result.data as string[] : []
       if (jsonMode) {
@@ -390,7 +452,7 @@ async function main() {
   }
 
   if (COMPOUND_CMDS.has(cmd)) {
-    await runCompoundCommand(cmd, filtered, { jsonMode, useWs, globalTabId, anyTab, contextId: globalContextId })
+    await runCompoundCommand(cmd, filtered, { jsonMode, useWs, globalTabId, anyTab, contextId: globalContextId, positionalCount: normalized.positionalCount })
     return
   }
 
@@ -409,18 +471,19 @@ async function main() {
   else if (NAV_CMDS.has(cmd))    action = parseNavigationCommand(filtered)
   else if (TAB_CMDS.has(cmd))    action = await parseTabsCommand(filtered)
   else if (NET_CMDS.has(cmd))    action = parseNetworkCommand(filtered)
-  else if (SS_CMDS.has(cmd))     action = parseScreenshotCommand(filtered)
+  else if (SS_CMDS.has(cmd))     action = parseScreenshotCommand(filtered, normalized.positionalCount)
   else if (DATA_CMDS.has(cmd))   action = parseDataCommand(filtered)
   else if (META_CMDS.has(cmd))   action = await parseMetaCommand(filtered, jsonMode, globalContextId)
-  else if (EVAL_CMDS.has(cmd))   action = parseEvalCommand(filtered)
+  else if (EVAL_CMDS.has(cmd))   action = parseEvalCommand(filtered, normalized.positionalCount)
   else if (SAVE_CMDS.has(cmd))   action = parseSaveCommand(filtered)
   else if (BRAND_CMDS.has(cmd))  action = parseBrandCommand(filtered)
   else if (GROUP_CMDS.has(cmd))  action = parseGroupCommand(filtered)
   else if (BATCH_CMDS.has(cmd))  action = parseBatchCommand(filtered)
   else if (POWER_CMDS.has(cmd))   action = parsePowerCommand(filtered)
-  else if (MONITOR_CMDS.has(cmd)) action = await parseMonitorCommand(filtered, jsonMode)
+  else if (MONITOR_CMDS.has(cmd)) action = await parseMonitorCommand(filtered, jsonMode, useWs)
   else if (SCENE_CMDS.has(cmd))   action = await parseSceneCommand(filtered, jsonMode)
   else if (SSE_CMDS.has(cmd))     action = parseSseCommand(filtered)
+  else if (BROWSER_CMDS.has(cmd)) action = parseBrowserCommand(filtered)
   else {
     // Unreachable: ALL_KNOWN_CMDS guard above rejects unknown commands
     // before this dispatch chain runs.
@@ -455,6 +518,7 @@ async function main() {
       if (action.ref !== undefined) assemble.ref = action.ref
       if (action.index !== undefined) assemble.index = action.index
       if (action.dropzone) assemble.dropzone = true
+      if (action.picker) assemble.picker = true
       const finalResult = unwrapResult(await send(assemble))
       console.log(formatResult(finalResult, jsonMode))
     } catch (err) {
@@ -519,9 +583,19 @@ async function main() {
   // Apply global modifiers
   if (anyTab) action.anyTab = true
   if (filtered.includes("--changes")) action.changes = true
-  const frameIdx = globalArgs.indexOf("--frame")
-  if (frameIdx !== -1 && globalArgs[frameIdx + 1]) {
-    action.frameId = parseInt(globalArgs[frameIdx + 1])
+
+  // Groups are per browser profile: with several extension contexts connected
+  // and no context resolved, list/close across all of them instead of failing
+  // with "multiple extensions connected" (cli/commands/group.ts).
+  if (GROUP_CMDS.has(cmd) && !globalContextId) {
+    const sendFn = (a: Action, tabId?: number, ctx?: string) => useWs ? sendCommandWs(a, tabId, ctx) : sendCommand(a, tabId, ctx)
+    const contextIds = await listExtensionContextIds(sendFn)
+    if (contextIds.length > 1) {
+      const result = await runGroupAcrossContexts(action, contextIds, sendFn)
+      console.log(formatResult(result, jsonMode))
+      if (!result.success) process.exitCode = 1
+      return
+    }
   }
 
   try {
@@ -626,10 +700,7 @@ async function main() {
     // the stale-extension-snapshot symptom after a pkg install (the running
     // browser keeps the old service worker until reloaded). Label it.
     if (!result.success && typeof result.error === "string" && result.error.startsWith("unknown action type:")) {
-      process.stderr.write(
-        `hint: the browser may be running an older Interceptor extension snapshot than this CLI (${VERSION}). ` +
-        `Run 'interceptor reload' (or reload the extension in the browser) and retry.\n`,
-      )
+      process.stderr.write(`${await staleExtensionHint(VERSION, globalContextId)}\n`)
     }
     console.log(formatResult(result, jsonMode))
     // Issue #237: a failed action (`back` with no history, a rejected
@@ -644,4 +715,7 @@ async function main() {
   }
 }
 
-main()
+main().catch(err => {
+  console.error(`error: ${err instanceof Error ? err.message : String(err)}`)
+  process.exitCode = 1
+})

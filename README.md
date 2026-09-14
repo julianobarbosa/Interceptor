@@ -39,7 +39,7 @@ Interceptor gives agents human-style control of the tools you already use — **
 
 - **Interceptor Browser** — runs as a WebExtension inside your actual Chrome, Brave, or Safari session. Your cookies, sessions, logins, and tabs stay intact. Read pages, click, type, navigate, observe network traffic, automate rich editors, record-and-replay user flows.
 - **Interceptor macOS** — runs as a Swift bridge daemon. Drives native macOS apps the same way: structured accessibility trees, OS-level trusted input, on-device vision/speech/NLP, system-wide event monitoring.
-- **Interceptor iOS** — drives any installed app on an owned, unlocked, Developer-Mode iPhone via an on-device XCUITest runner that dials into the daemon over WiFi: ref-tagged element trees, deterministic coordinate taps, reliable text entry, screenshots, and app lifecycle. Plus runner-free **Instruments/telemetry** (`ios proc / top / spawn / kill / location / gpu / shot`), an **on-device JS brain** (`ios eval` — a whole observe→decide→act loop runs on the phone in one round-trip), **WebKit inspection** (`ios web`), and classic-Lockdown **device services** (`ios logs / diag / fs / crash / profiles`). Addressed as `--on <phone>` / `ios:<udid>`. See `interceptor ios help`.
+- **Interceptor iOS** — drives any installed app on an owned, unlocked, Developer-Mode iPhone via an on-device XCUITest runner that dials into the daemon over the network (`interceptor ios status` shows the address it was handed as `dialBack`/`dialBackVia`; a VPN address is preferred, and LAN works once the runner is allowed under Settings › Privacy & Security › Local Network): ref-tagged element trees, deterministic coordinate taps, reliable text entry, screenshots, and app lifecycle. Plus runner-free **Instruments/telemetry** (`ios proc / top / spawn / kill / location / gpu / shot`), an **on-device JS brain** (`ios eval` — a whole observe→decide→act loop runs on the phone in one round-trip), **WebKit inspection** (`ios web`), and classic-Lockdown **device services** (`ios logs / diag / fs / crash / profiles`). Addressed as `--on <phone>` / `ios:<udid>`. See `interceptor ios help`.
 
 The agent calls `interceptor` CLI commands, reads the output, and decides what to do next. No MCP required. No API keys required.
 
@@ -83,9 +83,13 @@ Two core installers ship per release, plus an optional Safari add-on. Pick the c
 
 Both download from the same [Releases](https://github.com/Hacker-Valley-Media/Interceptor/releases) page. Start with **Browser** unless you know you need native macOS commands — you can always upgrade to Full later via `interceptor upgrade --full`.
 
-**Updating:** run `interceptor update`. It waits briefly for Sparkle and reports the selected update version, a no-update reason, or the real error. If the feed is slow, it returns `checking`; `interceptor update status` then shows the latest outcome, selected version, lifecycle phase, feed, and schedule. Full installs also auto-check in the background. When an update is found, an agent can drive Sparkle's prompt like any other window (`interceptor macos read --app interceptor-bridge`, then `interceptor macos act <ref>` on **Install Update**); the final install step always asks for an administrator password, which a person must enter.
+**Updating:** run `interceptor update`. It waits briefly for Sparkle and reports the selected update version, a no-update reason, or the real error. If the feed is slow, it returns `checking`; `interceptor update status` then shows the latest outcome, selected version, lifecycle phase, feed, schedule, live-session age, and `sessionInProgress`. A live session always reports `concluded: false` and includes the exact bridge restart command if recovery is needed. Full installs also auto-check in the background. When an update is found, both routes use Sparkle's standard window and show signed notes for the target release plus every published release since the installed version. An agent can drive that prompt like any other window (`interceptor macos read --app interceptor-bridge`, then `interceptor macos act <ref>` on **Install Update**); the final install step always asks for administrator authorization. Sparkle may relaunch after the signed package completes, but the bridge's process lock lets only the LaunchAgent-owned instance keep the PID and socket.
 
 **Windows (browser-only):** a signed per-user installer (`Interceptor-Browser-<version>-windows-{x64,arm64}.exe`, Windows 11 24H2+) is attached to each [release](https://github.com/Hacker-Valley-Media/Interceptor/releases) — see [docs/windows-install.md](docs/windows-install.md) for the install, silent-install, upgrade, and uninstall contract. Windows extension acquisition is store-based (Chrome Web Store for Chrome/Brave, Edge Add-ons for Edge); the installer never edits browser profiles or force-loads an unpacked extension. Windows developers can also build from source with `scripts/install.ps1` (PowerShell 7, source checkout).
+
+**Linux (browser-only):** release builds produce `Interceptor-Browser-<version>-linux-x64.tar.gz` for baseline x64 CPUs and `Interceptor-Browser-<version>-linux-arm64.tar.gz` for ARM64, plus `SHA256SUMS`. Extract the matching archive, then run `bash scripts/install.sh --browser-only --brave` or `--chrome`. The archive contains the CLI, daemon, extension, native-host template, installer, uninstaller, version metadata, README, and license. Native macOS commands are not included.
+
+**iPhone setup:** `interceptor ios setup [<device>] [--team <id>]` is the supported onboarding route. It requires Xcode signed in to an Apple Developer team, creates a team-scoped bundle ID, validates the signed app and provisioning profile, installs it, and records the actual ID for later launches. The packaged unsigned runner is only a build input. `ios install` will refuse that input and point back to `ios setup`; `ios login` is unavailable and fails before reading a password. After registration, the runner stays connected for the XCUITest session instead of expiring after 30 seconds. Later iOS commands reuse that session; a dropped runner socket is held for ten seconds so the runner's own re-dial rebinds it (`ios status` shows `connecting` meanwhile), and a new runner is launched only after that window lapses, the launch process exits, or the device is disabled. Before every launch the daemon validates the staged runner's signature and fails at once, naming `ios setup`, instead of waiting out a registration timeout; an early `xcodebuild` exit is reported with its exit code and stderr. A runner that `ios setup` built survives package upgrades (`ios refresh` rebuilds on a newer bundled runner), and `interceptor ios <sub> --help` prints help without running anything. The on-device XCTest authorization passcode sheet must be entered by a person or a paired hardware keyboard; no software path can type into it.
 
 ### Install steps
 
@@ -117,10 +121,14 @@ interceptor macos tree                         # macOS surface (Full pkg only, a
 | `interceptor-bridge.app` | `/Applications/interceptor-bridge.app` |
 | LaunchAgent (auto-start at login) | `/Library/LaunchAgents/com.interceptor.bridge.plist` |
 
-**Chrome/Brave extension load** is the one manual step the core installers cannot do for you, because those browsers do not allow programmatic extension installation outside of the Web Store. After install:
+**Chrome/Brave extension**: install it either way. Both copies share one extension ID and work the same. On a first package install, the installer opens the approved Chrome Web Store listing for you, but the browser still requires your click before installing it. Package and Sparkle upgrades do not reopen that page.
 
-- **Brave:** open `brave://extensions/`, enable Developer Mode, click **Load unpacked**, select `/Library/Application Support/Interceptor/extension/`.
-- **Chrome:** open `chrome://extensions/`, enable Developer Mode, click **Load unpacked**, select `/Library/Application Support/Interceptor/extension/`.
+- **Chrome Web Store** (default): https://chromewebstore.google.com/detail/interceptor/gomcpnagjjlhehnkoobkjgnkbleiooed. One click; new versions arrive when they clear store review.
+- **Unpacked copy** (developer path, always the same version as the installed CLI): open `brave://extensions/` or `chrome://extensions/`, enable Developer Mode, click **Load unpacked**, select `/Library/Application Support/Interceptor/extension/`.
+
+Keep one copy per profile. Loading the unpacked folder over a store install takes over the same extension entry (Chrome prefers the unpacked location), and removing it later does not bring the store copy back; reinstall from the store if you want it again. `interceptor diagnose` names which copy is connected (store or unpacked), its version, and whether the native messaging port is up.
+
+Both macOS package conclusions show these same two routes after installation. The extension popup keeps the Context ID, tab-group label, and tab-lifecycle settings, then reports whether the daemon is healthy over native messaging, WebSocket, or Safari native relay. A missing native host is shown as “Interceptor may not be installed” with a link to https://github.com/Hacker-Valley-Media/Interceptor/releases/latest; a stopped daemon gets a separate recovery message.
 
 **Safari extension load** uses its signed containing app:
 
@@ -201,6 +209,7 @@ Interceptor ships one CLI binary with two product surfaces. Pick by what you're 
 | Record & replay a human's native-app flow | macOS | `interceptor macos monitor *` |
 | Drive Apple Events to background apps without raising them | macOS | `interceptor macos intent dispatch` |
 | Deliver a stored password or passcode by name: admin prompts, `sudo`, native or web fields, the iPhone lock screen | macOS / Browser / iOS | `interceptor macos secret *`, `--secret <name>` on `type`, `macos sudo`, `macos authdialog`, `ios unlock` |
+| Log in with a password a Chromium browser already saved (no vault registration) | Browser (macOS) | `interceptor type <ref> --browser-login <host> [--user] [--browser <key>]`, `interceptor browser creds list` |
 | Drive any app on an owned, unlocked iPhone (tree/tap/type/screenshot/app lifecycle/unlock) | iOS | `interceptor ios tree / find / click / type / screenshot / app * / unlock` |
 | Runner-free iPhone process/telemetry, launch/kill, GPS simulation; on-device JS brain; WebKit inspection | iOS | `interceptor ios proc / top / spawn / kill / location / eval`, `ios web *` |
 
@@ -252,7 +261,7 @@ The recommended install path for end users is the signed `.pkg` documented in [I
 
 | Mode | What it installs | macOS TCC prompts | When to pick it |
 |---|---|---|---|
-| **`--browser-only`** | CLI + daemon + extension | None | You only want browser control. Smallest footprint, no Screen Recording / Accessibility / Apple Events prompts. Works on macOS and Windows. |
+| **`--browser-only`** | CLI + daemon + extension | None | You only want browser control. Smallest footprint, no Screen Recording / Accessibility / Apple Events prompts. Works on macOS, Windows, and Linux. |
 | **`--full`** | Everything in browser-only **plus** the Swift bridge `.app`, the LaunchAgent, and the macOS subcommands | Screen Recording, Accessibility, Apple Events (per-target-app on first dispatch) | You need `interceptor macos *` (native AX tree, OS-level input, ScreenCaptureKit, Vision/Speech/NLP). macOS 15+. |
 
 If you don't pass either flag, the script prompts. The default in the prompt is `--full` on macOS, `--browser-only` everywhere else.
@@ -342,7 +351,7 @@ bash scripts/uninstall.sh --bridge-only     # Remove only the macOS bridge (down
 |---|---|---|
 | `interceptor open <url>` returns `error: timeout: no response for 'tab_create' after 15s` | Browser extension is not loaded — most often because **Developer mode is off** in the target profile. Chromium silently drops `--load-extension` when Dev mode is off. | Open `brave://extensions/` or `chrome://extensions/`, toggle Developer mode ON. Quit the browser fully. Re-run `bash scripts/install.sh` (it will preflight Dev mode and re-launch). |
 | A timeout whose message says `A browser context is connected, so the extension is reachable` | The daemon still holds a live extension connection, so the request itself timed out — usually an oversized or slow response (for `net log`, too many full bodies in one reply). | Narrow the request: `net log --limit 20`, `--since <ts>` to page incrementally, or `--filter <host>`. The extension also budgets `net log` replies to 8 MiB of bodies; entries past the budget come back with `truncated: true` and an empty body. |
-| `interceptor status --verbose` says `extension: not reachable` | Same as above, or extension is registered but the Interceptor extension was disabled in the browser. | Open the extensions page, confirm Interceptor (ID `hkjbaciefhhgekldhncknbjkofbpenng`) is present and enabled. If missing, click **Load unpacked** and select `extension/dist/`. |
+| `interceptor status --verbose` says `extension: not reachable` | Same as above, or extension is registered but the Interceptor extension was disabled in the browser. | Open the extensions page, confirm Interceptor (ID `gomcpnagjjlhehnkoobkjgnkbleiooed`) is present and enabled. If missing, install it from the Chrome Web Store, or click **Load unpacked** and select `/Library/Application Support/Interceptor/extension/` (pkg install) or `extension/dist/` (source build). |
 | Chrome's extension error page shows `A preload for ... is found, but is not used because the request credentials mode does not match` attributed to `inject-net.js` | A page-level Chromium preload warning was attributed to Interceptor because the passive network shim calls through to the page's original `fetch()` there. The warning is not the same as an Interceptor connection failure. | Treat it as a site warning unless commands fail. If Interceptor commands fail, check the `extension: not reachable` row above. |
 | `chrome://extensions/` reports the extension as version `0.10.0` while `interceptor --version` reports a higher version | Extension manifest drift fixed in this release — rebuild from current source: `bash scripts/build.sh` then re-run `scripts/install.sh`. | Restart the browser after re-loading the extension so Chromium picks up the bumped manifest. |
 
@@ -362,11 +371,11 @@ The legacy individual commands (`interceptor tab new`, `interceptor tree`, `inte
 
 ## Core Concepts
 
-**Element Refs** — `interceptor tree` returns elements with refs like `e1`, `e5`, `e23`. Use these to click, type, hover. Refs survive between commands until the DOM changes.
+**Element Refs** — `interceptor tree` returns elements with refs like `e1`, `e5`, `e23`. Use these to click, type, hover. A ref stays valid while its element is still in the DOM (scrolling and layout flicker do not invalidate it); navigation, a rerender that recreates the node, or removal does. A ref whose element left the DOM fails as `stale element [eN] … nothing was clicked`; it is never re-bound to another element with the same label, so run `read` again for fresh refs (`find "<name>"` is the verb for search).
 
 **Interceptor Group** — Every `interceptor tab new` adds tabs to a managed Interceptor group. In supported agent shells, bare commands use a soft per-session group so `open` reuses one tab and idle cleanup can reap the session. `INTERCEPTOR_SESSION_ID` is the neutral contract; verified Maestro, Claude Code, and Codex variables are detected automatically and hashed into an opaque `s-<hash16>` label. Use a unique `--group <label>` or neutral session id for each concurrent lane. Explicit groups are hard-scoped by default. `--shared-group` uses the shared default Interceptor group, not unmanaged tabs. Your personal tabs stay outside the managed boundary unless you explicitly authorize `--any-tab`. `tab close <id>` and `tab switch <id>` act on exactly the id you pass; the applicable group check validates that same tab, and an explicit id takes precedence over `--tab`.
 
-**Focus Model (Background-First Contract)** — Interceptor never steals focus from the tab you're working in. `interceptor open <url>` and `interceptor tab new <url>` create their tabs in the **background** by default — the tab you had active stays active. Only four browser verbs intentionally move focus: `open --activate`, `tab new --activate`, `tab switch <id>`, and `window focus <id>`. The reuse path preserves the reused tab's existing focus state; add `--activate` to bring it forward. All other operations (`click`, `type`, `read`, `screenshot`, `net`, `scene`, `monitor`, etc.) work against the target tab without touching whichever tab you're looking at. This mirrors the macOS surface's same background-first contract — see `AGENTS.md` "Background First (Browser + macOS)" for the full inventory.
+**Focus Model (Background-First Contract)** — Interceptor never steals focus from the tab you're working in. `interceptor open <url>` and `interceptor tab new <url>` create their tabs in the **background** by default — the tab you had active stays active. When a window already holds Interceptor tab groups, new tabs are created in that window (the caller's own group's window first) rather than in whichever window you are focused on, so agent tabs stay together instead of following you from window to window. Only four browser verbs intentionally move focus: `open --activate`, `tab new --activate`, `tab switch <id>`, and `window focus <id>`. The reuse path preserves the reused tab's existing focus state; add `--activate` to bring it forward. All other operations (`click`, `type`, `read`, `screenshot`, `net`, `scene`, `monitor`, etc.) work against the target tab without touching whichever tab you're looking at. This mirrors the macOS surface's same background-first contract — see `AGENTS.md` "Background First (Browser + macOS)" for the full inventory.
 
 **Tab Lifecycle Policy** — Interceptor cleans up after itself. Two behaviors are set from the extension popup. **(1) Named-group reuse (default on):** `interceptor open <url>` in an automatic session group, or `open --group <label>`, navigates that group's most-recent tab instead of opening a new one. Shared-default `open` still creates because the most recent tab could belong to another lane. Explicit `--reuse` opts in anywhere, `--no-reuse` forces a new tab, and `tab new` creates by default while accepting explicit `--reuse`. **(2) Idle group close (default 10 min):** a managed group with no tab activity for the configured minutes is closed automatically (0 disables). Metadata polls such as `status` and `group list` do not reset the timer. Safety guards protect the focused window's active tab, pinned tabs, audible tabs, and each window's last tab. Sweeps are logged and closed tabs are restorable with ⌘⇧T or `interceptor sessions restore`.
 
@@ -441,11 +450,12 @@ interceptor click e5                         # Click element (synthetic; default
 interceptor click e5 --os                    # FALLBACK — OS-level CGEvent click (only when synthetic input is observed to fail)
 interceptor click e5 --at 10,20             # Click at offset within element
 interceptor click --selector "button span" --nth 4   # Click by CSS selector (0-based --nth matches query output; quote selectors with spaces)
-interceptor query "button span"              # Elements matching a CSS selector — each carries a clickable e<ref>, so any verb can act on it
+interceptor query "button span"              # CSS matches with count, returned, truncated, and clickable e<ref> values; at most 20 elements
 interceptor type e3 "hello"                  # Type into element (synthetic; default)
 interceptor type e3 "more" --append          # Append without clearing
 interceptor type "textbox:Search" "query"    # Type using semantic selector (role:name)
 interceptor type e3 --secret <name>          # Type a stored credential by name (see "Secret vault"); the value never leaves the daemon
+interceptor type e3 --browser-login <host> [--user] [--browser <key>]   # Fill a saved login from any installed Chromium browser (password, or username with --user); read + decrypted in the daemon
 interceptor select e7 "option-value"         # Select dropdown option
 interceptor hover e5                         # Hover over element
 interceptor keys "Control+A"                 # Keyboard shortcut (synthetic; default)
@@ -581,6 +591,11 @@ interceptor monitor status --task <taskId>             # Show task envelope stat
 interceptor monitor pause                              # Stop emitting events without ending
 interceptor monitor resume                             # Resume a paused session
 interceptor monitor task attach <taskId> <sessionId>   # Attach an existing source session
+interceptor monitor task create "<objective>"          # Durable agent task; no recording needed
+interceptor monitor task checkpoint <taskId> --file <json>   # Save revisioned constraints, target, checks, lessons
+interceptor monitor task resume <taskId>               # Compact state + scoped lessons for a later session
+interceptor monitor task verify <taskId>               # Run the stored checks now; lifecycle status unchanged
+interceptor monitor task complete <taskId>             # Complete only when every fresh check returns true
 interceptor monitor list                               # All sessions in the event log
 interceptor monitor tail                               # Live tail current session (pretty)
 interceptor monitor tail --raw                         # Live tail (raw JSONL)
@@ -594,6 +609,8 @@ interceptor monitor export <sessionId> --with-bodies   # Include persisted net-b
 Each event line is sparse JSON (short keys: `t`, `s`, `k`, `sid`, `ref`, `r`, `n`, `cause`) so an agent can read a 30-minute session in a few KB. User actions get a session-monotonic `seq`; mutations and network calls fired within 500ms of an action carry `cause: <action_seq>`. Real user events have `tr: true`; interceptor's own synthetic clicks have `tr: false`. The replay-plan generator automatically includes synthetic clicks when no real user events exist in the session (common when an agent drove the browser). Use `--include-synthetic` to force inclusion regardless.
 
 Tasks are task-scoped; monitor sessions are source-scoped. `--task` creates or attaches a durable task envelope under `${INTERCEPTOR_TASKS_DIR:-<platform app support>}/<taskId>/` while preserving the existing browser/macOS source artifacts. `interceptor monitor export <sessionId>` remains a source-session export. `interceptor monitor export --task <taskId> --format timeline|transcript|json` builds a task-level view by deterministically merging attached source logs, then validating semantic transcript entries against source references.
+
+Task checkpoints carry the objective, constraints, owner, browser target (context, group, tab, frame, origin), next action, lessons, and JavaScript predicates. `resume` returns only lessons whose context and origin match. `verify` and `complete` evaluate the predicates fresh in the page's main world without reloading, and `complete` exits nonzero unless every check returns boolean `true`. Writers are serialized by a per-task lock with dead-owner reclaim, and a stale `expectedRevision` is rejected. Schema and workflow: `.agents/skills/interceptor-browser/workflows/task-state.md`.
 
 The rolling live event stream lives in `/tmp/interceptor-events.jsonl`. Export prefers per-session artifacts under `/tmp/interceptor-monitor-sessions/<sessionId>/` (one directory per session containing `events.jsonl`, `session.json`, and `net.jsonl`) and falls back to the rolling event log for legacy sessions. `--with-bodies` uses persisted correlated net-body artifacts when present (body previews are capped at 64 KiB, redact `Authorization` / `Cookie` / token-shaped strings, and only persist JSON / text content types) and otherwise leaves `interceptor net log` hints in the replay output.
 
@@ -629,6 +646,8 @@ interceptor screenshot --quality 80          # Encode quality 0-100 (defaults: p
 interceptor screenshot --target-max-long-edge 1568   # Auto-resize at capture (clamps long edge)
 ```
 
+`--save` takes no value and writes an automatically named image in the current directory. A positional path such as `screenshot --save shot.png` is rejected before browser capture or file creation.
+
 When the DOM renderer fails outright on a heavy page (the serialized SVG won't decode), a default whole-page `screenshot` automatically retries via the pixel path so the command still produces an image. The fallback preserves the DOM path's PNG default (no silent JPEG downgrade), only applies to whole-page captures (element/ref/region requests fail honestly instead of cropping wrong), and reports itself in a `fallback` note — including that the pixel path transiently borrowed tab focus and scrolled the page (both restored). `--no-fallback` forbids the retry entirely.
 
 `screenshot` invocations are auto-routed through the WebSocket transport because base64 dataUrl responses larger than ~50KB are unreliable over the native-messaging port on Brave/Chromium. Override with `--no-ws` if needed.
@@ -655,9 +674,12 @@ interceptor raw '{"type":"any_action","key":"value"}'  # Send any raw action
 ### Meta
 ```bash
 interceptor status                           # Daemon status (local check, no connection needed)
-interceptor help                             # Full CLI help
+interceptor status --verbose                 # Per-context reachability and whether eval --main (userScripts) is available
+interceptor help [<command> [<sub>]]         # Full CLI help, or one verb (e.g. help upload, help macos tree)
 interceptor contexts                         # List IDs of all connected browser contexts
-interceptor reload                           # Reload extension
+interceptor contexts --verbose               # Also kind, version, store/unpacked, extension ID, transports
+interceptor contexts rename <name>           # Restore a context name after an extension ID change
+interceptor reload                           # Unpacked copy: reload from disk; store copy: ask the store for an update first
 interceptor capabilities                     # Check available input layers
 ```
 
@@ -668,13 +690,15 @@ interceptor capabilities                     # Check available input layers
 | `--json` | JSON output instead of plain text |
 | `--tab <id>` | Target specific tab by ID. When an action names its own tab (`tab close <id>`, `tab switch <id>`), the explicit id wins over `--tab`. |
 | `--any-tab` | Operate outside the interceptor group (also required to `tab close <id>` / `tab switch <id>` an unmanaged tab) |
-| `--context <id>` | Route command to a specific browser context (profile). See `interceptor contexts`. Omitting this flag succeeds only when exactly one context is connected; the daemon errors when zero or multiple contexts are present. |
+| `--context <id>` | Route command to a specific browser context (profile). See `interceptor contexts`. `INTERCEPTOR_CONTEXT=<id>` sets the lane default (the flag overrides it). With neither, the command succeeds only when exactly one context is connected; `status --verbose`, `group list`, and `group close` work across every connected context. |
 | `--os` | FALLBACK: use OS-level CGEvent (macOS) when synthetic input is observed to fail. Default to synthetic — the pre-load `userActivation` override + `__interceptor_trust` event marker satisfy most `isTrusted` checks. |
-| `--frame <id>` | Target specific iframe |
+| `--frame <id>` | Target exactly that iframe on any browser verb, including `eval`. Accepted before or after the command; a missing frame fails instead of silently running in the top frame. |
 | `--changes` | Include DOM diff in response |
 | `--flag=value`, `--` | `--flag=value` is accepted everywhere; `--` ends flag parsing so a positional may begin with `--` |
 
-Flags are order-independent on browser commands, and **unknown flags are rejected** (exit 1, naming the flag and the command) instead of being ignored — a typo such as `screenshot --out shot.png` no longer looks like a success (`screenshot` writes to disk with `--save`). `INTERCEPTOR_LAX_FLAGS=1` downgrades the rejection to a one-line warning for legacy scripts. `interceptor macos *` and `interceptor ios *` keep their verb-first parsing and are not strict. A command whose result is a failure prints `error: …` (or the JSON envelope under `--json`) **and exits non-zero** — since 0.23.40 that covers every browser verb (`back`/`forward` with no history used to print the error and exit 0), so scripts can trust `$?`.
+Flags are order-independent on browser commands, and **unknown flags are rejected** (exit 1, naming the flag and the command) instead of being ignored — a typo such as `screenshot --out shot.png` no longer looks like a success (`screenshot` writes to disk with `--save`). `--selector`/`--nth` belong to `click` alone; other action verbs reject them with a `query "<css>"` hint. Output budget: `INTERCEPTOR_TREE_MAX_CHARS` (default 50000) and `INTERCEPTOR_TEXT_MAX_CHARS` (default 8000) cap `open`/`read` output, and `open --tree-format compact` returns the compact tree; a truncated result ends in a marker that says how to scope or widen. `INTERCEPTOR_LAX_FLAGS=1` downgrades the rejection to a one-line warning for legacy scripts. `interceptor macos *` and `interceptor ios *` keep their verb-first parsing and are not strict. A command whose result is a failure prints `error: …` (or the JSON envelope under `--json`) **and exits non-zero** — since 0.23.40 that covers every browser verb (`back`/`forward` with no history used to print the error and exit 0), so scripts can trust `$?`.
+
+`interceptor eval` reports thrown exceptions, rejected promises, and syntax errors as failures (exit 1) in both the isolated and `--main` worlds, and supports top-level `await`. `--main` on a strict-CSP page may strip the header and reload the tab once; the result discloses the reload.
 
 ## Browser Recipes
 
@@ -1188,7 +1212,7 @@ Every status is a string from Apple's `AVAuthorizationStatus` vocabulary (`grant
 interceptor macos files watch ~/Desktop          # Watch directory for changes
 interceptor macos fs read /path/to/file          # Native FileManager read
 interceptor macos fs write /path/to/file "..."   # Native FileManager write
-interceptor macos fs search "query"              # Spotlight (NSMetadataQuery)
+interceptor macos fs search "query" [--timeout-ms N]   # Spotlight; partial:true when the deadline (default 10 s) cut a pass
 ```
 
 See [`docs/native/fs.md`](docs/native/fs.md) for the `fs` domain detail.
@@ -1294,10 +1318,18 @@ interceptor macos authdialog status                 # is an administrator prompt
 interceptor macos authdialog fill --secret <name> [--submit]   # presses "Use Password" on a Touch ID sheet, types, submits
 interceptor macos type [<ref>] --secret <name> [--app X]       # native field (target: macos:<bundleId>)
 interceptor type <ref> --secret <name>              # browser field (target: browser:<host>); monitor records ***SECURE***
-interceptor ios type <ref> --secret <name> | ios keys --secret <name> | ios unlock --secret <name>   # passcode sheets + lock screen
+interceptor type <ref> --browser-login <host> [--user] [--browser <key>]   # fill a saved login from any installed Chromium browser; host must match the live tab
+interceptor browser creds list [--host <host>]      # list saved logins across installed Chromium browsers (host + username + browser; no passwords; refused under MCP)
+interceptor ios type <ref> --secret <name> | ios keys --secret <name> | ios unlock --secret <name>   # passcode sheets + lock screen (unlock needs a connected resident runner)
 ```
 
 Items live in the data-protection keychain owned by the signed bridge (login keychain on unsigned dev builds); `~/.interceptor/secrets.json` holds names, gates, targets, and release counts only. Releases are unattended by default; `--gate touchid` asks the OS prompt (Touch ID, Apple Watch, or the Mac password when no sensor is available). A target mismatch fails with `target_denied` and is never retargeted.
+
+#### Browser saved logins (fill a password you never registered)
+
+When the credential already lives in a Chromium browser's own password manager (Chrome, Brave, Vivaldi, Edge, Chromium, Arc), you do not need to register it in the vault. `type --browser-login <host>` reads the saved login for the current page and fills it, searching whichever browsers are installed (or one you name with `--browser <key>`). The browser does not fire its autofill dropdown for a synthetic click, so Interceptor reads the credential at rest instead: it fetches the `<Brand> Safe Storage` key from the login keychain, decrypts the `Login Data` blob (macOS `v10`, AES-128-CBC) for the matching profile, and hands the value to the same delivery leg as `--secret`. The value never appears on argv, in logs, events, monitor artifacts, or MCP results.
+
+The fill is bound to the page: the requested host must match the live tab's host, and the resolved credential's own origin must match too, so a page can only ever fill its own saved login. Enumeration (`browser creds list`) returns host + username + browser only, never the password, and is refused for model callers (`INTERCEPTOR_MCP`). macOS only; the newer app-bound encryption (`v20`) is refused rather than mis-decrypted. Reading `Login Data` requires the daemon to have Full Disk Access.
 
 #### Personal data (TCC-gated)
 
